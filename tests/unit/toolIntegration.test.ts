@@ -56,6 +56,10 @@ function fakeState(runtime: Partial<LspExtensionState["runtimeManager"]> = {}): 
         filePath: join(tempHome, "index.ts"),
         uri: `file://${join(tempHome, "index.ts")}`,
         diagnostics: [],
+        status: "unverified",
+        received: true,
+        targetVersion: 1,
+        diskCheck: "matched",
       }),
       hover: async () => ({
         serverId: "vtsls",
@@ -142,7 +146,8 @@ describe("LSP tool integration", () => {
       filePath: join(tempHome, "index.ts"),
     } as never);
 
-    expect(result?.content[0]?.text).toContain("No LSP diagnostics");
+    expect(result?.content[0]?.text).toContain("unverified");
+    expect(result?.content[0]?.text).toContain("Received diagnostic snapshot is empty");
   });
 
   it("lsp_diagnostics returns failure when not initialized", async () => {

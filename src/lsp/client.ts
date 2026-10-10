@@ -37,6 +37,7 @@ import {
 } from "vscode-languageserver-protocol";
 import { URI } from "vscode-uri";
 import { getLogsDir } from "../config/paths.js";
+import { LspError } from "./errors.js";
 import type { JsonObject, JsonValue, ResolvedServerConfig } from "../registry/schema.js";
 import type { LspProcessRegistry } from "./processRegistry.js";
 
@@ -79,12 +80,31 @@ export interface LspClientDocument {
   text: string;
 }
 
-export interface LspDiagnosticsResult {
+export interface DiagnosticPublication {
+  diagnostics: Diagnostic[];
+  version?: number;
+  sequence: number;
+  arrivedAt: number;
+}
+
+export interface DiagnosticsSnapshot {
+  status: "pending" | "fresh" | "stale" | "unverified";
+  received: boolean;
+  targetVersion: number;
+  currentVersion?: number;
+  publicationVersion?: number;
+  knownPublicationVersion?: number;
+  sequence?: number;
+  arrivedAt?: number;
+  diagnostics: Diagnostic[];
+}
+
+export interface LspDiagnosticsResult extends DiagnosticsSnapshot {
   serverId: string;
   rootDir: string;
   filePath: string;
   uri: string;
-  diagnostics: Diagnostic[];
+  diskCheck: "matched" | "changed" | "unavailable";
 }
 
 export class LspClient {
@@ -100,7 +120,14 @@ export class LspClient {
   private readonly pid: number;
   private readonly process: LspServerProcess;
   private readonly connection: LspConnection;
-  private readonly diagnosticsByUri = new Map<string, Diagnostic[]>();
+  // Keep the newest versioned evidence even when the latest notification has no version.
+  private readonly diagnosticsByUri = new Map<
+    string,
+    { versioned?: DiagnosticPublication; unversioned?: DiagnosticPublication }
+  >();
+  private readonly diagnosticListeners = new Set<() => void>();
+  private publicationSequence = 0;
+  private stopping = false;
   private readonly documents = new Map<string, LspClientDocument>();
   private readonly disposables: Disposable[] = [];
   private capabilities: ServerCapabilities | undefined;
@@ -127,10 +154,12 @@ export class LspClient {
     this.registerConnectionHandlers();
     this.process.once("exit", () => {
       this.exited = true;
+      this.notifyDiagnosticListeners();
       void this.processRegistry.unregister(this.id, this.pid);
     });
     this.process.once("error", () => {
       this.exited = true;
+      this.notifyDiagnosticListeners();
     });
   }
 
@@ -153,37 +182,129 @@ export class LspClient {
     this.connection.listen();
     const result = await this.request<InitializeResult>(InitializeRequest.method, this.initializeParams());
     this.capabilities = result.capabilities;
+    if (this.capabilities.positionEncoding && this.capabilities.positionEncoding !== "utf-16") {
+      throw new LspError("Server selected an unsupported position encoding; UTF-16 is required.", "start-failed");
+    }
     await this.connection.sendNotification(InitializedNotification.method, {});
     this.initialized = true;
   }
 
   async syncFile(filePath: string, languageId: string, text: string): Promise<string> {
+    return (await this.syncDocument(filePath, languageId, text)).uri;
+  }
+
+  async syncDocument(filePath: string, languageId: string, text: string): Promise<Readonly<LspClientDocument>> {
+    this.ensureActive();
     const uri = URI.file(filePath).toString();
     const existing = this.documents.get(uri);
+    if (existing?.text === text) return { ...existing };
+    const document = { uri, filePath, languageId, text, version: (existing?.version ?? 0) + 1 };
+    this.documents.set(uri, document);
+    this.notifyDiagnosticListeners();
     if (!existing) {
-      const document: LspClientDocument = { uri, filePath, languageId, text, version: 1 };
-      this.documents.set(uri, document);
       await this.connection.sendNotification(DidOpenTextDocumentNotification.method, {
         textDocument: { uri, languageId, version: document.version, text },
       });
-      return uri;
-    }
-
-    if (existing.text !== text) {
-      existing.version += 1;
-      existing.text = text;
-      existing.languageId = languageId;
+    } else {
       await this.connection.sendNotification(DidChangeTextDocumentNotification.method, {
-        textDocument: { uri, version: existing.version },
+        textDocument: { uri, version: document.version },
         contentChanges: [{ text }],
       });
     }
-
-    return uri;
+    return { ...document };
   }
 
-  getDiagnostics(uri: string): Diagnostic[] {
-    return this.diagnosticsByUri.get(uri) ?? [];
+  getDiagnostics(uri: string): DiagnosticPublication | undefined {
+    const records = this.diagnosticsByUri.get(uri);
+    const known = records?.versioned;
+    const unknown = records?.unversioned;
+    return unknown && (!known || unknown.sequence > known.sequence) ? unknown : known;
+  }
+
+  async waitForDiagnostics(
+    document: Readonly<LspClientDocument>,
+    waitMs: number,
+    signal?: AbortSignal,
+  ): Promise<DiagnosticsSnapshot> {
+    const check = (): DiagnosticsSnapshot => {
+      if (signal?.aborted) throw new LspError("Diagnostic query cancelled.", "cancelled");
+      this.ensureActive();
+      return this.diagnosticSnapshot(document);
+    };
+    const ready = (snapshot: DiagnosticsSnapshot) =>
+      snapshot.status === "fresh" || snapshot.status === "unverified" || snapshot.currentVersion !== document.version;
+    const initial = check();
+    if (ready(initial) || waitMs <= 0) return initial;
+    return new Promise((resolvePromise, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.diagnosticListeners.delete(onChange);
+        signal?.removeEventListener("abort", onChange);
+      };
+      const onChange = () => {
+        try {
+          const snapshot = check();
+          if (ready(snapshot)) {
+            cleanup();
+            resolvePromise(snapshot);
+          }
+        } catch (error) {
+          cleanup();
+          reject(error);
+        }
+      };
+      this.diagnosticListeners.add(onChange);
+      signal?.addEventListener("abort", onChange, { once: true });
+      const timer = setTimeout(
+        () => {
+          try {
+            const snapshot = check();
+            cleanup();
+            resolvePromise(snapshot);
+          } catch (error) {
+            cleanup();
+            reject(error);
+          }
+        },
+        Math.max(0, waitMs),
+      );
+      // Also covers cached or synchronous publications arriving before listener registration.
+      onChange();
+    });
+  }
+
+  private diagnosticSnapshot(document: Readonly<LspClientDocument>): DiagnosticsSnapshot {
+    const publication = this.getDiagnostics(document.uri);
+    const currentVersion = this.documents.get(document.uri)?.version;
+    const drifted = currentVersion !== document.version;
+    return {
+      status: drifted
+        ? "stale"
+        : !publication
+          ? "pending"
+          : publication.version === undefined
+            ? "unverified"
+            : publication.version === document.version
+              ? "fresh"
+              : "stale",
+      received: publication !== undefined,
+      targetVersion: document.version,
+      currentVersion,
+      ...(publication
+        ? { publicationVersion: publication.version, sequence: publication.sequence, arrivedAt: publication.arrivedAt }
+        : {}),
+      knownPublicationVersion: this.diagnosticsByUri.get(document.uri)?.versioned?.version,
+      diagnostics: publication?.diagnostics ?? [],
+    };
+  }
+
+  private ensureActive(): void {
+    if (this.stopping) throw new LspError("LSP client is shutting down.", "shutdown");
+    if (this.exited) throw new LspError("LSP server exited.", "server-exited");
+  }
+
+  private notifyDiagnosticListeners(): void {
+    for (const listener of [...this.diagnosticListeners]) listener();
   }
 
   async hover(uri: string, line: number, character: number): Promise<Hover | null> {
@@ -230,6 +351,8 @@ export class LspClient {
   }
 
   async shutdown(): Promise<boolean> {
+    this.stopping = true;
+    this.notifyDiagnosticListeners();
     if (this.exited) {
       await this.processRegistry.unregister(this.id, this.pid);
       return true;
@@ -269,7 +392,7 @@ export class LspClient {
 
   private ensureCapability(feature: string, capability: unknown): void {
     if (!capability) {
-      throw new Error(`${this.serverId} does not support LSP ${feature}.`);
+      throw new LspError(`${this.serverId} does not support LSP ${feature}.`, "unsupported-capability");
     }
   }
 
@@ -284,6 +407,7 @@ export class LspClient {
       rootUri,
       workspaceFolders,
       capabilities: {
+        general: { positionEncodings: ["utf-16"] },
         textDocument: {
           synchronization: { dynamicRegistration: false, willSave: false, willSaveWaitUntil: false, didSave: false },
           hover: { dynamicRegistration: false, contentFormat: ["markdown", "plaintext"] },
@@ -294,7 +418,7 @@ export class LspClient {
             hierarchicalDocumentSymbolSupport: true,
             symbolKind: { valueSet: supportedSymbolKinds() },
           },
-          publishDiagnostics: { relatedInformation: true, tagSupport: { valueSet: [1, 2] } },
+          publishDiagnostics: { versionSupport: true, relatedInformation: true, tagSupport: { valueSet: [1, 2] } },
         },
         workspace: {
           configuration: true,
@@ -311,7 +435,23 @@ export class LspClient {
     this.disposables.push(
       this.connection.onNotification(PublishDiagnosticsNotification.method, (params) => {
         if (!isPublishDiagnosticsParams(params)) return;
-        this.diagnosticsByUri.set(params.uri, params.diagnostics);
+        const records = this.diagnosticsByUri.get(params.uri) ?? {};
+        if (
+          params.version !== undefined &&
+          records.versioned?.version !== undefined &&
+          params.version < records.versioned.version
+        )
+          return;
+        const publication: DiagnosticPublication = {
+          diagnostics: params.diagnostics,
+          version: params.version,
+          sequence: ++this.publicationSequence,
+          arrivedAt: Date.now(),
+        };
+        if (params.version === undefined) records.unversioned = publication;
+        else records.versioned = publication;
+        this.diagnosticsByUri.set(params.uri, records);
+        this.notifyDiagnosticListeners();
       }),
     );
 
@@ -329,7 +469,12 @@ export class LspClient {
   }
 
   private async request<T>(method: string, params?: unknown, timeoutMs = this.requestTimeoutMs): Promise<T> {
-    return withTimeout(this.connection.sendRequest<T>(method, params), timeoutMs, `${this.serverId} ${method}`);
+    try {
+      return await withTimeout(this.connection.sendRequest<T>(method, params), timeoutMs, `${this.serverId} ${method}`);
+    } catch (error) {
+      if (this.exited) throw new LspError("LSP server exited during the request.", "server-exited");
+      throw error;
+    }
   }
 
   private async waitForExit(timeoutMs: number): Promise<boolean> {
@@ -406,14 +551,19 @@ function supportedSymbolKinds(): SymbolKind[] {
   return Array.from({ length: 26 }, (_value, index) => index + 1) as SymbolKind[];
 }
 
-function isPublishDiagnosticsParams(value: unknown): value is { uri: string; diagnostics: Diagnostic[] } {
+function isPublishDiagnosticsParams(
+  value: unknown,
+): value is { uri: string; diagnostics: Diagnostic[]; version?: number } {
   return (
     typeof value === "object" &&
     value !== null &&
     "uri" in value &&
     typeof value.uri === "string" &&
     "diagnostics" in value &&
-    Array.isArray(value.diagnostics)
+    Array.isArray(value.diagnostics) &&
+    (!("version" in value) ||
+      value.version === undefined ||
+      (typeof value.version === "number" && Number.isInteger(value.version)))
   );
 }
 
@@ -456,7 +606,10 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
     return await Promise.race([
       promise,
       new Promise<T>((_resolve, reject) => {
-        timeout = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms.`)), timeoutMs);
+        timeout = setTimeout(
+          () => reject(new LspError(`${label} timed out after ${timeoutMs}ms.`, "timeout")),
+          timeoutMs,
+        );
       }),
     ]);
   } finally {

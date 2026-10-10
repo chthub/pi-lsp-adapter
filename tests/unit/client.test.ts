@@ -262,11 +262,12 @@ describe("LspClient", () => {
     });
 
     const diags = client.getDiagnostics("file:///repo/index.ts");
-    expect(diags).toHaveLength(1);
-    expect(diags[0].message).toBe("error");
+    expect(diags?.diagnostics).toHaveLength(1);
+    expect(diags?.diagnostics[0].message).toBe("error");
+    expect(diags?.version).toBeUndefined();
   });
 
-  it("returns empty diagnostics for unknown uri", () => {
+  it("returns no publication for unknown uri", () => {
     const process = new FakeProcess(9999);
     const connection = new FakeConnection();
     const registry = new LspProcessRegistry({ path: registryPath, ownerId: "test", probe: fakeProbe() });
@@ -281,7 +282,7 @@ describe("LspClient", () => {
     });
 
     const diags = client.getDiagnostics("file:///repo/unknown.ts");
-    expect(diags).toEqual([]);
+    expect(diags).toBeUndefined();
   });
 
   it("throws when requesting unsupported capability", async () => {

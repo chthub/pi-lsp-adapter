@@ -13,12 +13,16 @@ import type {
 import { URI } from "vscode-uri";
 import { messageFromError as baseMessageFromError } from "../util/helpers.js";
 import type { LspDiagnosticsResult } from "../lsp/client.js";
+import { LspError, errorRecovery, type LspErrorCode, type LspErrorPayload } from "../lsp/errors.js";
+import { truncateUtf8 } from "../lsp/sourceContext.js";
+import { validateSymbol } from "../lsp/positionSelector.js";
 import type { LspRuntimeFileResult, LspWorkspaceSymbolsResult } from "../lsp/runtimeManager.js";
 import type { LspResultCache } from "./resultCache.js";
 
 export interface LspToolResult<TDetails> {
   content: [{ type: "text"; text: string }];
   details: TDetails;
+  isError?: boolean;
 }
 
 export interface FormatOptions {
@@ -38,16 +42,28 @@ export interface PageMetadata<TItem> {
   rootDir?: string;
   filePath?: string;
   resultId?: string;
+  status?: LspDiagnosticsResult["status"];
+  targetVersion?: number;
+  currentVersion?: number;
+  publicationVersion?: number;
+  knownPublicationVersion?: number;
+  received?: boolean;
+  sequence?: number;
+  arrivedAt?: number;
+  diskCheck?: LspDiagnosticsResult["diskCheck"];
+  resolvedPosition?: { line: number; column: number };
+  selector?: { symbol: string };
 }
 
 export interface PositionInput {
   line: number;
-  column: number;
+  column?: number;
+  symbol?: string;
 }
 
 export interface LspPosition {
   line: number;
-  character: number;
+  character: number | string;
 }
 
 export interface DisplayPosition {
@@ -85,18 +101,59 @@ export interface NormalizedSymbol {
 }
 
 export function toLspPosition(input: PositionInput): LspPosition {
-  return {
-    line: Math.max(0, Math.trunc(input.line) - 1),
-    character: Math.max(0, Math.trunc(input.column) - 1),
-  };
+  if ((input.column !== undefined) === (input.symbol !== undefined)) {
+    throw new LspError("Provide exactly one of column or symbol, not both or neither.", "invalid-selector");
+  }
+  if (input.symbol !== undefined) {
+    if (typeof input.symbol !== "string") throw new LspError("symbol must be a string identifier.", "invalid-selector");
+    validateSymbol(input.symbol);
+  }
+  if (input.column !== undefined && typeof input.column !== "number")
+    throw new LspError("column must be a number.", "invalid-position");
+  return { line: input.line - 1, character: input.symbol ?? input.column! - 1 };
 }
 
 export function success<TDetails>(text: string, details: TDetails): LspToolResult<TDetails> {
   return { content: [{ type: "text", text }], details };
 }
 
-export function failure(tool: string, error: unknown): LspToolResult<{ ok: false; tool: string; error: string }> {
-  return success(`${tool} failed: ${messageFromError(error)}`, { ok: false, tool, error: messageFromError(error) });
+export interface FailureDetails extends LspErrorPayload {
+  ok: false;
+  tool: string;
+  error: string;
+  category: LspErrorCode;
+  retryable: boolean;
+  recovery: string;
+}
+
+export function failure(tool: string, error: unknown): LspToolResult<FailureDetails> {
+  const category = error instanceof LspError ? error.code : "unknown";
+  const guidance = errorRecovery(category);
+  const message = truncateUtf8(messageFromError(error), 1024);
+  const payload = error instanceof LspError ? error.payload : undefined;
+  const lines = [`${tool} failed [${category}]: ${message}`];
+  if (payload?.context) {
+    const label =
+      payload.context.kind === "file-end"
+        ? "Requested line does not exist; below is the file end"
+        : payload.context.kind === "file-start"
+          ? "Requested line is invalid; below is the file start"
+          : "Current source context";
+    lines.push(
+      `${label} (1-based lines ${payload.context.startLine}-${payload.context.endLine}):`,
+      payload.context.text,
+    );
+  }
+  if (payload?.candidates) {
+    lines.push(
+      `Lexical candidates: ${payload.candidates.map((p) => `${p.line}:${p.column}`).join(", ")}${payload.candidatesTruncated ? " [candidates truncated]" : ""}`,
+    );
+  }
+  lines.push(`Unchanged retry may help: ${guidance.retryable ? "yes" : "no"}. ${guidance.recovery}`);
+  return {
+    ...success(lines.join("\n"), { ok: false, tool, error: message, category, ...guidance, ...payload }),
+    isError: true,
+  };
 }
 
 export function formatDiagnostics(
@@ -105,10 +162,20 @@ export function formatDiagnostics(
   options: FormatOptions = {},
 ): LspToolResult<PageMetadata<NormalizedDiagnostic>> {
   const diagnostics = result.diagnostics.map(normalizeDiagnostic).sort(compareDiagnostics);
+  const evidence = `Original query snapshot: ${result.status}; target document version ${result.targetVersion}; publication version ${result.publicationVersion ?? "not provided"}; synchronized version at return ${result.currentVersion ?? "unknown"}; disk check ${result.diskCheck}.`;
+  const limitation =
+    result.status === "pending"
+      ? "Diagnostics not ready: no usable publication arrived within the wait budget."
+      : result.status === "stale"
+        ? "Stale snapshot: do not treat these as current diagnostics."
+        : result.status === "unverified"
+          ? "Document version or disk consistency unverified: not confirmed clean."
+          : "Publication matches this document version and the return-time disk check; this is not proof all project checks finished.";
+  const title = `LSP diagnostics for ${result.filePath} (${result.serverId}):\n${evidence}\n${limitation}`;
   return paginateItems({
     kind: "diagnostics",
-    title: `LSP diagnostics for ${result.filePath} (${result.serverId}):`,
-    emptyText: `No LSP diagnostics for ${result.filePath}.`,
+    title,
+    emptyText: `${title}\n${result.received ? "Received diagnostic snapshot is empty." : "No diagnostic publication received."}`,
     items: diagnostics,
     pageSize: options.pageSize ?? 50,
     cache,
@@ -116,6 +183,15 @@ export function formatDiagnostics(
       serverId: result.serverId,
       rootDir: result.rootDir,
       filePath: result.filePath,
+      status: result.status,
+      targetVersion: result.targetVersion,
+      currentVersion: result.currentVersion,
+      publicationVersion: result.publicationVersion,
+      knownPublicationVersion: result.knownPublicationVersion,
+      received: result.received,
+      sequence: result.sequence,
+      arrivedAt: result.arrivedAt,
+      diskCheck: result.diskCheck,
     },
     formatItem: (diagnostic) =>
       `- ${diagnostic.severity} ${formatRangeStart(diagnostic.range)} ${diagnostic.message}${formatSource(diagnostic)}`,
@@ -129,6 +205,8 @@ export function formatHover(result: LspRuntimeFileResult<Hover | null>): LspTool
   filePath: string;
   hover: string | null;
   range?: DisplayRange;
+  resolvedPosition?: { line: number; column: number };
+  selector?: { symbol: string };
 }> {
   const hoverText = result.result ? hoverToText(result.result) : "";
   const range = result.result?.range ? displayRange(result.result.range) : undefined;
@@ -140,6 +218,8 @@ export function formatHover(result: LspRuntimeFileResult<Hover | null>): LspTool
       rootDir: result.rootDir,
       filePath: result.filePath,
       hover: hoverText || null,
+      ...(result.resolvedPosition ? { resolvedPosition: result.resolvedPosition } : {}),
+      ...(result.selector ? { selector: result.selector } : {}),
       ...(range ? { range } : {}),
     },
   );
@@ -226,7 +306,7 @@ function paginateItems<TItem>(input: {
   items: TItem[];
   pageSize: number;
   cache?: LspResultCache;
-  baseDetails: Pick<PageMetadata<TItem>, "serverId" | "rootDir" | "filePath">;
+  baseDetails: Partial<Omit<PageMetadata<TItem>, "items">>;
   formatItem: (item: TItem) => string;
 }): LspToolResult<PageMetadata<TItem>> {
   if (input.items.length === 0) {
@@ -300,6 +380,8 @@ function formatPaginatedLocations(
       serverId: result.serverId,
       rootDir: result.rootDir,
       filePath: result.filePath,
+      ...(result.resolvedPosition ? { resolvedPosition: result.resolvedPosition } : {}),
+      ...(result.selector ? { selector: result.selector } : {}),
     },
     formatItem: (location) => {
       const where = location.range ? ` ${formatRangeStart(location.range)}` : "";

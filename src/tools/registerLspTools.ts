@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { LspError } from "../lsp/errors.js";
 import type { LspExtensionState } from "../state.js";
 import { setLspStatusLine } from "../statusLine.js";
 import {
@@ -20,26 +21,44 @@ const FilePathParams = Type.Object({
   filePath: Type.String({ description: "Path to the source file to inspect." }),
 });
 
-const FilePositionParams = Type.Object({
+const positionProperties = {
   filePath: Type.String({ description: "Path to the source file to inspect." }),
-  line: Type.Integer({ minimum: 1, description: "1-based line number." }),
-  column: Type.Integer({
-    minimum: 1,
-    description: "1-based column/character number. For symbol queries, place it on the identifier token.",
-  }),
-});
-
-const ReferencesParams = Type.Object({
-  filePath: Type.String({ description: "Path to the source file to inspect." }),
-  line: Type.Integer({ minimum: 1, description: "1-based line number." }),
-  column: Type.Integer({
-    minimum: 1,
-    description: "1-based column/character number. For symbol queries, place it on the identifier token.",
-  }),
-  includeDeclaration: Type.Optional(
-    Type.Boolean({ description: "Whether to include the symbol declaration in the result." }),
+  // Pi 1.1.0 converts fractional Type.Integer inputs by truncating them. Number +
+  // multipleOf preserves the same integer constraint without silently moving a position.
+  line: Type.Number({ minimum: 1, multipleOf: 1, description: "1-based integer line number." }),
+  column: Type.Optional(
+    Type.Number({
+      minimum: 1,
+      multipleOf: 1,
+      description: "1-based UTF-16 column on the identifier. Provide column OR symbol, exactly one.",
+    }),
   ),
-});
+  symbol: Type.Optional(
+    Type.String({
+      minLength: 1,
+      maxLength: 256,
+      pattern: "^[$_\\p{ID_Start}][$\\p{ID_Continue}\\u200c\\u200d]*$",
+      description:
+        "Single identifier on this line (not a path/expression). Unique lexical match required; ambiguity fails. Provide symbol OR column.",
+    }),
+  ),
+};
+const positionOptions = {
+  oneOf: [
+    { required: ["column"], not: { required: ["symbol"] } },
+    { required: ["symbol"], not: { required: ["column"] } },
+  ],
+};
+const FilePositionParams = Type.Object(positionProperties, positionOptions);
+const ReferencesParams = Type.Object(
+  {
+    ...positionProperties,
+    includeDeclaration: Type.Optional(
+      Type.Boolean({ description: "Whether to include the symbol declaration in the result." }),
+    ),
+  },
+  positionOptions,
+);
 
 const WorkspaceSymbolsParams = Type.Object({
   query: Type.String({ description: "Workspace symbol query string." }),
@@ -59,7 +78,8 @@ export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): v
   pi.registerTool<typeof FilePathParams, unknown>({
     name: "lsp_diagnostics",
     label: "LSP Diagnostics",
-    description: "Read diagnostics for a file using its configured language server.",
+    description:
+      "Read a diagnostic snapshot for a file. Reports pending, fresh, stale, or unverified with version evidence; an empty result is not proof that all checks passed.",
     promptSnippet: "Inspect compiler/type/lint diagnostics from configured language servers for a file.",
     promptGuidelines: [
       "Use lsp_diagnostics after reading or editing code when semantic errors, type errors, or language-server diagnostics would help.",
@@ -67,9 +87,13 @@ export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): v
     parameters: FilePathParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = getState();
-      if (!state) return failure("lsp_diagnostics", "LSP extension is not initialized.");
+      if (!state)
+        return failure("lsp_diagnostics", new LspError("LSP extension is not initialized.", "not-initialized"));
       try {
-        const result = formatDiagnostics(await state.runtimeManager.diagnostics(params.filePath), state.resultCache);
+        const result = formatDiagnostics(
+          await state.runtimeManager.diagnostics(params.filePath, _signal),
+          state.resultCache,
+        );
         refreshStatus(ctx, state);
         return result;
       } catch (error) {
@@ -82,15 +106,16 @@ export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): v
   pi.registerTool<typeof FilePositionParams, unknown>({
     name: "lsp_hover",
     label: "LSP Hover",
-    description: "Get hover/type information at a source position. line and column are 1-based.",
-    promptSnippet: "Fetch hover/type information for a symbol at a 1-based line and column.",
+    description:
+      "Get hover/type information using 1-based line plus exactly one of column (UTF-16) or symbol (unique identifier on that line). Failures include recovery feedback.",
+    promptSnippet: "Fetch hover/type information using a 1-based line and column or symbol.",
     promptGuidelines: [
-      "Use lsp_hover when symbol type, signature, documentation, or inferred information would reduce guesswork. Put line/column on the identifier token itself, not whitespace or surrounding syntax.",
+      "Use lsp_hover when symbol type, signature, documentation, or inferred information would reduce guesswork. Supply line plus a unique symbol name, or put an explicit column on the identifier token itself.",
     ],
     parameters: FilePositionParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = getState();
-      if (!state) return failure("lsp_hover", "LSP extension is not initialized.");
+      if (!state) return failure("lsp_hover", new LspError("LSP extension is not initialized.", "not-initialized"));
       try {
         const position = toLspPosition(params);
         const result = formatHover(
@@ -108,15 +133,17 @@ export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): v
   pi.registerTool<typeof FilePositionParams, unknown>({
     name: "lsp_definition",
     label: "LSP Definition",
-    description: "Find definition locations for the symbol at a source position. line and column are 1-based.",
-    promptSnippet: "Jump to definitions for a symbol at a 1-based line and column.",
+    description:
+      "Find definitions using 1-based line plus exactly one of column (UTF-16) or symbol (unique identifier on that line). Ambiguity is rejected.",
+    promptSnippet: "Jump to definitions using a 1-based line and column or symbol.",
     promptGuidelines: [
-      "Use lsp_definition before changing unfamiliar call sites, types, or imported symbols. Put line/column on the identifier token itself, not an import path string or surrounding syntax.",
+      "Use lsp_definition before changing unfamiliar call sites, types, or imported symbols. Supply line plus a unique symbol name, or put an explicit column on the identifier token itself.",
     ],
     parameters: FilePositionParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = getState();
-      if (!state) return failure("lsp_definition", "LSP extension is not initialized.");
+      if (!state)
+        return failure("lsp_definition", new LspError("LSP extension is not initialized.", "not-initialized"));
       try {
         const position = toLspPosition(params);
         const result = formatDefinition(
@@ -135,15 +162,17 @@ export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): v
   pi.registerTool<typeof ReferencesParams, unknown>({
     name: "lsp_references",
     label: "LSP References",
-    description: "Find references for the symbol at a source position. line and column are 1-based.",
-    promptSnippet: "Find references for a symbol at a 1-based line and column.",
+    description:
+      "Find references using 1-based line plus exactly one of column (UTF-16) or symbol (unique identifier on that line). Ambiguity is rejected.",
+    promptSnippet: "Find references using a 1-based line and column or symbol.",
     promptGuidelines: [
-      "Use lsp_references to assess impact before renames, API changes, or behavior changes. Put line/column on the identifier token itself; set includeDeclaration when you need the declaration included in the results.",
+      "Use lsp_references to assess impact before renames, API changes, or behavior changes. Supply line plus a unique symbol name, or put an explicit column on the identifier token itself; set includeDeclaration when you need the declaration included in the results.",
     ],
     parameters: ReferencesParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = getState();
-      if (!state) return failure("lsp_references", "LSP extension is not initialized.");
+      if (!state)
+        return failure("lsp_references", new LspError("LSP extension is not initialized.", "not-initialized"));
       try {
         const position = toLspPosition(params);
         const result = formatReferences(
@@ -175,7 +204,8 @@ export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): v
     parameters: FilePathParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = getState();
-      if (!state) return failure("lsp_document_symbols", "LSP extension is not initialized.");
+      if (!state)
+        return failure("lsp_document_symbols", new LspError("LSP extension is not initialized.", "not-initialized"));
       try {
         const result = formatDocumentSymbols(
           await state.runtimeManager.documentSymbols(params.filePath),
@@ -202,7 +232,8 @@ export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): v
     parameters: WorkspaceSymbolsParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const state = getState();
-      if (!state) return failure("lsp_workspace_symbols", "LSP extension is not initialized.");
+      if (!state)
+        return failure("lsp_workspace_symbols", new LspError("LSP extension is not initialized.", "not-initialized"));
       try {
         const result = formatWorkspaceSymbols(
           await state.runtimeManager.workspaceSymbols(params.query, params.serverId),
@@ -230,7 +261,7 @@ export function registerLspTools(pi: ExtensionAPI, getState: GetLspToolState): v
     parameters: MoreParams,
     async execute(_toolCallId, params) {
       const state = getState();
-      if (!state) return failure("lsp_more", "LSP extension is not initialized.");
+      if (!state) return failure("lsp_more", new LspError("LSP extension is not initialized.", "not-initialized"));
       return state.resultCache.next(params.resultId);
     },
   });

@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -82,6 +82,141 @@ describe("LspRuntimeManager", () => {
     );
     await expect(runtime.hover("src/index.ts", 0, 99)).rejects.toThrow("column 100 was requested on line 1");
     await expect(runtime.registry.list()).resolves.toEqual([]);
+  });
+
+  it("returns typed source context and never spawns for invalid coordinates", async () => {
+    await writeFile(join(projectDir, "src", "index.ts"), "first()\nsecond()\nfit()\nfourth()\nfifth()", "utf8");
+    const spawner = vi.fn(() => new FakeProcess(nextPid++));
+    const runtime = runtimeManager({ spawner });
+    for (const [line, character] of [
+      [2, 99],
+      [99, 0],
+      [-1, 0],
+      [0.5, 0],
+      [0, -1],
+    ]) {
+      await expect(runtime.hover("src/index.ts", line!, character!)).rejects.toMatchObject({
+        code: "invalid-position",
+        payload: { fileLineCount: 5, requestedPosition: { line: line! + 1, column: character! + 1 } },
+      });
+    }
+    expect(spawner).not.toHaveBeenCalled();
+  });
+
+  it("classifies missing files before spawning", async () => {
+    const runtime = runtimeManager();
+    await expect(runtime.hover("src/missing.ts", 0, 0)).rejects.toMatchObject({ code: "file-not-found" });
+    expect(runtime.activeClients()).toEqual([]);
+  });
+
+  it("resolves symbols in the synchronized snapshot for all position tools", async () => {
+    await writeFile(join(projectDir, "src", "index.ts"), "\t😀 中文 fit(data)", "utf8");
+    const connections: FakeConnection[] = [];
+    const runtime = runtimeManager({
+      connectionFactory: (process) => {
+        const connection = new FakeConnection(process.pid!);
+        connections.push(connection);
+        return connection;
+      },
+    });
+    for (const method of ["hover", "definition", "references"] as const) {
+      const result = await runtime[method]("src/index.ts", 0, "fit");
+      expect(result.resolvedPosition).toEqual({ line: 1, column: 8 });
+      expect(result.selector).toEqual({ symbol: "fit" });
+      expect(connections[0]?.requests.at(-1)?.params).toMatchObject({ position: { line: 0, character: 7 } });
+    }
+    expect(connections[0]?.notifications.find((n) => n.method === "textDocument/didOpen")?.params).toMatchObject({
+      textDocument: { text: "\t😀 中文 fit(data)" },
+    });
+  });
+
+  it("does not spawn for missing, ambiguous or invalid symbol selectors", async () => {
+    await writeFile(join(projectDir, "src", "index.ts"), "fit(); // fit()", "utf8");
+    const spawner = vi.fn(() => new FakeProcess(nextPid++));
+    const runtime = runtimeManager({ spawner });
+    await expect(runtime.hover("src/index.ts", 0, "fit")).rejects.toMatchObject({ code: "ambiguous-symbol" });
+    await expect(runtime.hover("src/index.ts", 0, "missing")).rejects.toMatchObject({ code: "symbol-not-found" });
+    await expect(runtime.hover("src/index.ts", 0, "")).rejects.toMatchObject({ code: "invalid-selector" });
+    await expect(runtime.hover("src/index.ts", 99, "fit")).rejects.toMatchObject({
+      code: "invalid-position",
+      payload: { requestedPosition: { line: 100, symbol: "fit" } },
+    });
+    expect(spawner).not.toHaveBeenCalled();
+    const explicit = await runtime.hover("src/index.ts", 0, 10);
+    expect(explicit.resolvedPosition).toEqual({ line: 1, column: 11 });
+  });
+
+  it("refuses symlink escapes without disclosing outside source", async () => {
+    const outside = join(tempDir, "secret.ts");
+    await writeFile(outside, "OUTSIDE_SECRET");
+    await symlink(outside, join(projectDir, "src", "link.ts"));
+    const runtime = runtimeManager();
+    await expect(runtime.hover("src/link.ts", 99, 0)).rejects.toMatchObject({
+      code: "outside-workspace",
+      payload: undefined,
+    });
+    expect(runtime.activeClients()).toEqual([]);
+  });
+
+  it("serializes positional snapshots against sibling read warmup", async () => {
+    const path = join(projectDir, "src", "index.ts");
+    await writeFile(path, "fit()");
+    let finishRequest!: () => void;
+    let requestStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      requestStarted = resolve;
+    });
+    const connection = new FakeConnection(5000);
+    const send = connection.sendRequest.bind(connection);
+    vi.spyOn(connection, "sendRequest").mockImplementation(async <R>(method: string, params?: unknown): Promise<R> => {
+      if (method !== HoverRequest.method) return send<R>(method, params);
+      requestStarted();
+      await new Promise<void>((resolve) => {
+        finishRequest = resolve;
+      });
+      return null as R;
+    });
+    const runtime = runtimeManager({ connectionFactory: () => connection });
+    const query = runtime.hover("src/index.ts", 0, "fit");
+    await started;
+    await writeFile(path, "other(); fit()");
+    const warmup = runtime.warmupFile("src/index.ts");
+    expect(connection.notifications.filter((n) => n.method === "textDocument/didChange")).toHaveLength(0);
+    finishRequest();
+    expect((await query).resolvedPosition).toEqual({ line: 1, column: 1 });
+    await warmup;
+    expect(connection.notifications.filter((n) => n.method === "textDocument/didChange")).toHaveLength(1);
+  });
+
+  it("cleans up a startup overlapping session shutdown", async () => {
+    await writeFile(join(projectDir, "src", "index.ts"), "fit()");
+    let finishStart!: () => void;
+    let startEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      startEntered = resolve;
+    });
+    const connection = new FakeConnection(5000);
+    const send = connection.sendRequest.bind(connection);
+    vi.spyOn(connection, "sendRequest").mockImplementation(async <R>(method: string, params?: unknown): Promise<R> => {
+      if (method === InitializeRequest.method) {
+        startEntered();
+        await new Promise<void>((resolve) => {
+          finishStart = resolve;
+        });
+      }
+      return send<R>(method, params);
+    });
+    const runtime = runtimeManager({ connectionFactory: () => connection });
+    const query = runtime.diagnostics("src/index.ts");
+    const assertion = expect(query).rejects.toMatchObject({ code: "shutdown" });
+    await entered;
+    const shutdown = runtime.shutdown();
+    finishStart();
+    await assertion;
+    await shutdown;
+    expect(runtime.activeClients()).toEqual([]);
+    await expect(runtime.registry.list()).resolves.toEqual([]);
+    await expect(runtime.diagnostics("src/index.ts")).rejects.toMatchObject({ code: "shutdown" });
   });
 
   it("reports missing installed metadata without spawning", async () => {
@@ -319,6 +454,7 @@ class NonExitingFakeProcess extends EventEmitter implements LspServerProcess {
 }
 
 class FakeConnection implements LspConnection {
+  readonly requests: Array<{ method: string; params: unknown }> = [];
   readonly notifications: Array<{ method: string; params: unknown }> = [];
   private readonly notificationHandlers = new Map<string, (params: unknown) => void>();
 
@@ -335,7 +471,8 @@ class FakeConnection implements LspConnection {
 
   listen(): void {}
 
-  async sendRequest<R>(method: string): Promise<R> {
+  async sendRequest<R>(method: string, params?: unknown): Promise<R> {
+    this.requests.push({ method, params });
     if (method === InitializeRequest.method) {
       return { capabilities: this.capabilities } as R;
     }

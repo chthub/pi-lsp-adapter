@@ -14,7 +14,7 @@ import { setLspStatusLine } from "./statusLine.js";
 import type { LspExtensionState } from "./state.js";
 
 const LSP_GUIDANCE =
-  'LSP integration: read-only LSP tools are available for diagnostics, hover/type info, definitions, references, document symbols, and workspace symbol search. Prefer these tools when semantic code understanding would reduce guesswork; they use 1-based line/column inputs and do not mutate files. For hover, definition, and references, place the column on the identifier token itself. When an LSP result says "More available" and includes a resultId, use lsp_more only if you need the next sequential page; re-run the original LSP query if the resultId is missing or expired.';
+  'LSP integration: read-only LSP tools are available for diagnostics, hover/type info, definitions, references, document symbols, and workspace symbol search. Prefer these tools when semantic code understanding would reduce guesswork; they use 1-based line/column positions and do not mutate files. For hover, definition, and references, supply line plus exactly one of an explicit column on the identifier token itself or a unique symbol name on that line. When an LSP result says "More available" and includes a resultId, use lsp_more only if you need the next sequential page; re-run the original LSP query if the resultId is missing or expired.';
 
 export default function piAgentLspExtension(pi: ExtensionAPI): void {
   let state: LspExtensionState | null = null;

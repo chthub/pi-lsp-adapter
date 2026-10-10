@@ -88,15 +88,15 @@ Useful first commands:
 
 The extension registers these read-only tools:
 
-| Tool                    | Use it for                                            | Required input                                         |
-| ----------------------- | ----------------------------------------------------- | ------------------------------------------------------ |
-| `lsp_diagnostics`       | Compiler/type/lint diagnostics for one file           | `filePath`                                             |
-| `lsp_hover`             | Type, signature, and documentation at a position      | `filePath`, 1-based `line`, 1-based `column`           |
-| `lsp_definition`        | Definition locations for a symbol                     | `filePath`, 1-based `line`, 1-based `column`           |
-| `lsp_references`        | Reference locations for a symbol                      | `filePath`, 1-based `line`, 1-based `column`           |
-| `lsp_document_symbols`  | Classes, functions, variables, and other file symbols | `filePath`                                             |
-| `lsp_workspace_symbols` | Symbol search across active or selected workspaces    | `query`; optional `serverId`                           |
-| `lsp_more`              | Next page from a cached multi-page LSP result         | Exact `resultId` returned by a previous paginated call |
+| Tool                    | Use it for                                            | Required input                                                  |
+| ----------------------- | ----------------------------------------------------- | --------------------------------------------------------------- |
+| `lsp_diagnostics`       | Compiler/type/lint diagnostics for one file           | `filePath`                                                      |
+| `lsp_hover`             | Type, signature, and documentation at a position      | `filePath`, 1-based `line`, exactly one of `column` or `symbol` |
+| `lsp_definition`        | Definition locations for a symbol                     | `filePath`, 1-based `line`, exactly one of `column` or `symbol` |
+| `lsp_references`        | Reference locations for a symbol                      | `filePath`, 1-based `line`, exactly one of `column` or `symbol` |
+| `lsp_document_symbols`  | Classes, functions, variables, and other file symbols | `filePath`                                                      |
+| `lsp_workspace_symbols` | Symbol search across active or selected workspaces    | `query`; optional `serverId`                                    |
+| `lsp_more`              | Next page from a cached multi-page LSP result         | Exact `resultId` returned by a previous paginated call          |
 
 Examples:
 
@@ -112,7 +112,60 @@ lsp_hover({ filePath: "src/index.ts", line: 42, column: 13 })
 lsp_workspace_symbols({ query: "RuntimeManager", serverId: "vtsls" })
 ```
 
-Line and column inputs are 1-based. For hover, definitions, and references, put the column on the identifier token itself rather than on whitespace or an import path string.
+Line and column inputs are 1-based integers; columns count UTF-16 code units, not display width. Put an explicit column on the identifier token itself rather than on whitespace or an import path string. Alternatively, let the tool compute the column:
+
+```text
+lsp_definition({ filePath: "src/model.ts", line: 120, symbol: "fit" })
+lsp_references({ filePath: "src/model.ts", line: 120, symbol: "fit", includeDeclaration: true })
+```
+
+Provide **exactly one** of `column` or `symbol`. A symbol must be a single identifier (at most 256 Unicode characters), not `object.fit`, an expression, or a regex. Lookup is limited to that line in the same source snapshot used for validation and synchronization. Boundaries include Unicode, `_`, and `$`; tabs and non-BMP characters retain their UTF-16 offsets. Successful results include `resolvedPosition` and, for symbol input, `selector` in details.
+
+Multiple lexical matches produce `ambiguous-symbol` with at most 32 candidate coordinates; none produces `symbol-not-found`. Retry with an explicit candidate column rather than expecting the tool to pick the first match. Comments and strings are not parsed out: matching text there can cause ambiguity. This does not repair wrong line numbers or prove a lexical match is the intended semantic symbol. The client advertises UTF-16 only and rejects a server that selects another encoding.
+
+Pi 1.1.0 truncates fractional inputs for TypeBox `Integer` schemas. Position schemas therefore use `number` with `multipleOf: 1` and `minimum: 1`, preserving the integer-only contract without silently moving fractional coordinates. The adapter itself never clamps or truncates positions.
+
+### Failures and recovery
+
+Execution/input failures return `isError: true` and `details.ok: false`. Details include `category`, `retryable`, and `recovery`; category and recovery advice also appear in model-facing text. `retryable` means an **unchanged** query might work later, not that future queries are forbidden. Timeouts and exited servers can be retried; invalid coordinates need corrected arguments, and missing servers need explicit installation. Categories come from typed errors at their source (including filesystem errno), not guesses from text. Unclassified exceptions use `unknown`; output omits stacks and bounds exception summaries.
+
+Empty definitions/references and exhausted pagination are successful results. Invalid/expired `lsp_more` IDs are failures: rerun the original query for a new ID. No automatic installation, retry, position correction, or edit is added.
+
+Local coordinate validation runs before starting a server. Column overflow shows the target line and up to two actual lines on either side. Beyond EOF, output explicitly labels the final five available lines as the file end. LF, CRLF, and CR have identical counting; an empty document has one empty line, and a final newline creates a final empty line. Negative/fractional positions are rejected, not clamped. Source excerpts are at most 2 KiB UTF-8, with a 320-byte source-text limit per line and explicit truncation markers, without splitting Unicode characters. Workspace/permission failures do not supply source context; symlinks resolving outside the workspace are refused.
+
+Synthetic example (all five lines are real contents from the synthetic snapshot):
+
+```text
+lsp_definition failed [invalid-position]: column 40 was requested on line 12, but the maximum column is 27
+Current source context (1-based lines 10-14):
+10 | def predict(data):
+11 |     prepared = normalize(data)
+12 |     result = fit(prepared)
+13 |     validate(result)
+14 |     return result
+Unchanged retry may help: no. Locate the intended symbol in this source before retrying with valid 1-based coordinates.
+```
+
+These tools have no output schema: Pi's codemode receives text on success and **rejects** with the complete feedback text on failure. `Promise.allSettled()` can capture it. Catching a failure can let the enclosing script complete successfully, but the nested LSP call remains recorded as an error; script completion alone does not mean the query succeeded.
+
+### Diagnostic snapshot status
+
+`lsp_diagnostics` still accepts only `filePath`. Text and details identify status, queried `targetVersion`, synchronized `currentVersion`, optional `publicationVersion`, and return-time `diskCheck`. Details also retain `received`, accepted publication `sequence`/`arrivedAt`, and `knownPublicationVersion` when available.
+
+| Status       | Meaning                                                                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `pending`    | No usable publication arrived within the budget: not ready, not clean.                                                                |
+| `fresh`      | Publication version matches the immutable queried version, with no known sibling-version drift and a matching return-time disk check. |
+| `stale`      | Publication version differs, or the target changed during the query; displayed results are not current.                               |
+| `unverified` | Publication has no version, or disk consistency could not be checked; current-source attribution is not confirmed.                    |
+
+A received empty snapshot differs from never receiving a publication. Even fresh empty results only mean **that document version's publication was empty**, not that every dependency/project check finished or passed. A disk check observes return-time content; it does not lock against future edits. These incomplete states are successful executions with `details.ok: true`; startup/communication failures remain errors.
+
+Internal `diagnosticsWaitMs` is a bounded budget (still 350 ms by default), not an unconditional sleep. Matching cached results and no-version publications can return immediately. Cancellation, shutdown/session replacement, and server exit settle waits and clean timers/listeners. Calls share servers and capture versions independently. Positional synchronization/request sequences are serialized per file against sibling read warmup; diagnostic waits do not block newer versions.
+
+Older out-of-order versioned publications cannot replace newer evidence. The latest accepted no-version publication is displayed as `unverified`, retaining versioned evidence separately. Arrival after `didChange` alone never implies freshness. Restarted clients have separate caches.
+
+Diagnostic pagination retains the **original query snapshot's** status/evidence on every page. `lsp_more` does not recheck disk or relabel that snapshot as current. Schemas/descriptions remain static, but upgrading their definitions can change request prefixes and affect context/cache reuse; this is not a zero-cost interface change.
 
 ## Supported servers
 

@@ -1,6 +1,9 @@
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
+import { LspError, fileReadError } from "./errors.js";
+import { sourceContext, splitLines } from "./sourceContext.js";
+import { resolveSymbol } from "./positionSelector.js";
 import { isAbsolute, relative, resolve } from "node:path";
-import { delay } from "../util/helpers.js";
+
 import type {
   Definition,
   DocumentSymbol,
@@ -18,7 +21,13 @@ import { readLockfile, type LockfileOptions } from "../install/lockfile.js";
 import type { InstalledServerMetadata, ServerDefinition } from "../registry/schema.js";
 import { resolveServerConfig } from "../resolve/resolveServer.js";
 import type { LspProcessRegistry } from "./processRegistry.js";
-import { LspClient, type LspConnectionFactory, type LspDiagnosticsResult, type LspServerSpawner } from "./client.js";
+import {
+  LspClient,
+  type LspConnectionFactory,
+  type LspDiagnosticsResult,
+  type LspClientDocument,
+  type LspServerSpawner,
+} from "./client.js";
 
 export interface LspRuntimeManagerOptions {
   cwd: string;
@@ -50,6 +59,8 @@ export interface LspRuntimeFileResult<T> {
   filePath: string;
   uri: string;
   result: T;
+  resolvedPosition?: { line: number; column: number };
+  selector?: { symbol: string };
 }
 
 export interface LspWorkspaceSymbolsResult {
@@ -96,22 +107,7 @@ interface StartClientInput extends EnsureClientInput {
   key: string;
 }
 
-export class LspRuntimeError extends Error {
-  constructor(
-    message: string,
-    readonly code:
-      | "no-filetype"
-      | "no-server"
-      | "not-installed"
-      | "declined"
-      | "start-failed"
-      | "outside-workspace"
-      | "invalid-position",
-  ) {
-    super(message);
-    this.name = "LspRuntimeError";
-  }
-}
+export class LspRuntimeError extends LspError {}
 
 export class LspRuntimeManager {
   private readonly cwd: string;
@@ -128,6 +124,8 @@ export class LspRuntimeManager {
   private readonly clients = new Map<string, LspClient>();
   private readonly starting = new Map<string, Promise<ClientTarget>>();
   private readonly filetypeCache = new Map<string, string>();
+  private readonly fileQueues = new Map<string, Promise<void>>();
+  private closed = false;
 
   constructor(options: LspRuntimeManagerOptions) {
     this.cwd = options.cwd;
@@ -181,8 +179,10 @@ export class LspRuntimeManager {
   }
 
   async shutdown(): Promise<void> {
+    this.closed = true;
     this.filetypeCache.clear();
     await this.shutdownClients(() => true);
+    await Promise.allSettled(this.starting.values());
   }
 
   async stopServer(serverId?: string): Promise<number> {
@@ -192,86 +192,95 @@ export class LspRuntimeManager {
 
   async warmupFile(filePath: string): Promise<boolean> {
     try {
-      const selected = await this.selectServerForFile(filePath);
-      const target = await this.ensureClient({
-        server: selected.server,
-        rootDir: selected.rootDir,
-        rootMarker: selected.rootMarker,
-        allowPromptInstall: false,
-        allowAutoInstall: false,
+      return await this.withFileQueue(filePath, async () => {
+        const selected = await this.selectServerForFile(filePath);
+        const target = await this.ensureClient({
+          server: selected.server,
+          rootDir: selected.rootDir,
+          rootMarker: selected.rootMarker,
+          allowPromptInstall: false,
+          allowAutoInstall: false,
+        });
+        await target.client.syncFile(selected.filePath, selected.filetype, selected.text);
+        return true;
       });
-      await target.client.syncFile(selected.filePath, selected.filetype, selected.text);
-      return true;
     } catch {
       return false;
     }
   }
 
-  async diagnostics(filePath: string): Promise<LspDiagnosticsResult> {
-    const target = await this.prepareFileTarget(filePath);
-    await delay(this.diagnosticsWaitMs);
+  async diagnostics(filePath: string, signal?: AbortSignal): Promise<LspDiagnosticsResult> {
+    if (signal?.aborted) throw new LspRuntimeError("Diagnostic query cancelled.", "cancelled");
+    const target = await this.withFileQueue(filePath, () => {
+      if (signal?.aborted) throw new LspRuntimeError("Diagnostic query cancelled.", "cancelled");
+      return this.prepareFileTarget(filePath);
+    });
+    await target.client.waitForDiagnostics(target.document, this.diagnosticsWaitMs, signal);
+    let diskCheck: LspDiagnosticsResult["diskCheck"] = "unavailable";
+    try {
+      const [root, path] = await Promise.all([realpath(this.cwd), realpath(target.filePath)]);
+      if (isPathInside(root, path)) diskCheck = (await readFile(path, "utf8")) === target.text ? "matched" : "changed";
+      else diskCheck = "changed";
+    } catch {
+      /* The source may have disappeared or become unreadable during the query. */
+    }
+    const snapshot = await target.client.waitForDiagnostics(target.document, 0, signal);
     return {
+      ...snapshot,
+      status:
+        diskCheck === "changed"
+          ? "stale"
+          : diskCheck === "unavailable" && snapshot.status === "fresh"
+            ? "unverified"
+            : snapshot.status,
       serverId: target.client.serverId,
       rootDir: target.client.rootDir,
       filePath: target.filePath,
       uri: target.uri,
-      diagnostics: target.client.getDiagnostics(target.uri),
+      diskCheck,
     };
   }
 
-  async hover(filePath: string, line: number, character: number): Promise<LspRuntimeFileResult<Hover | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
-    return {
-      serverId: target.client.serverId,
-      rootDir: target.client.rootDir,
-      filePath: target.filePath,
-      uri: target.uri,
-      result: await target.client.hover(target.uri, line, character),
-    };
+  async hover(filePath: string, line: number, character: number | string): Promise<LspRuntimeFileResult<Hover | null>> {
+    return this.queryPosition(filePath, line, character, (target) =>
+      target.client.hover(target.uri, line, target.character),
+    );
   }
 
   async definition(
     filePath: string,
     line: number,
-    character: number,
+    character: number | string,
   ): Promise<LspRuntimeFileResult<Definition | LocationLink[] | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
-    return {
-      serverId: target.client.serverId,
-      rootDir: target.client.rootDir,
-      filePath: target.filePath,
-      uri: target.uri,
-      result: await target.client.definition(target.uri, line, character),
-    };
+    return this.queryPosition(filePath, line, character, (target) =>
+      target.client.definition(target.uri, line, target.character),
+    );
   }
 
   async references(
     filePath: string,
     line: number,
-    character: number,
+    character: number | string,
     includeDeclaration = false,
   ): Promise<LspRuntimeFileResult<Location[] | null>> {
-    const target = await this.prepareFilePositionTarget(filePath, line, character);
-    return {
-      serverId: target.client.serverId,
-      rootDir: target.client.rootDir,
-      filePath: target.filePath,
-      uri: target.uri,
-      result: await target.client.references(target.uri, line, character, includeDeclaration),
-    };
+    return this.queryPosition(filePath, line, character, (target) =>
+      target.client.references(target.uri, line, target.character, includeDeclaration),
+    );
   }
 
   async documentSymbols(
     filePath: string,
   ): Promise<LspRuntimeFileResult<DocumentSymbol[] | SymbolInformation[] | null>> {
-    const target = await this.prepareFileTarget(filePath);
-    return {
-      serverId: target.client.serverId,
-      rootDir: target.client.rootDir,
-      filePath: target.filePath,
-      uri: target.uri,
-      result: await target.client.documentSymbols(target.uri),
-    };
+    return this.withFileQueue(filePath, async () => {
+      const target = await this.prepareFileTarget(filePath);
+      return {
+        serverId: target.client.serverId,
+        rootDir: target.client.rootDir,
+        filePath: target.filePath,
+        uri: target.uri,
+        result: await target.client.documentSymbols(target.uri),
+      };
+    });
   }
 
   async workspaceSymbols(
@@ -315,7 +324,49 @@ export class LspRuntimeManager {
     return active;
   }
 
-  private async prepareFileTarget(filePath: string): Promise<SelectedServer & { client: LspClient; uri: string }> {
+  // Serialize only sync + positional requests per file. Diagnostic waiting stays outside
+  // the queue, so newer versions and sibling waiters remain independent.
+  private async withFileQueue<T>(filePath: string, operation: () => Promise<T>): Promise<T> {
+    const key = this.resolvePath(filePath);
+    const previous = this.fileQueues.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const tail = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    this.fileQueues.set(key, tail);
+    await previous;
+    try {
+      if (this.closed) throw new LspRuntimeError("LSP session shut down or was replaced.", "shutdown");
+      return await operation();
+    } finally {
+      release();
+      if (this.fileQueues.get(key) === tail) this.fileQueues.delete(key);
+    }
+  }
+
+  private async queryPosition<T>(
+    filePath: string,
+    line: number,
+    character: number | string,
+    query: (target: { client: LspClient; uri: string; character: number }) => Promise<T>,
+  ): Promise<LspRuntimeFileResult<T>> {
+    return this.withFileQueue(filePath, async () => {
+      const target = await this.prepareFilePositionTarget(filePath, line, character);
+      return {
+        serverId: target.client.serverId,
+        rootDir: target.client.rootDir,
+        filePath: target.filePath,
+        uri: target.uri,
+        result: await query(target),
+        resolvedPosition: { line: line + 1, column: target.character + 1 },
+        ...(typeof character === "string" ? { selector: { symbol: character } } : {}),
+      };
+    });
+  }
+
+  private async prepareFileTarget(
+    filePath: string,
+  ): Promise<SelectedServer & { client: LspClient; uri: string; document: Readonly<LspClientDocument> }> {
     const selected = await this.selectServerForFile(filePath);
     return this.attachClient(selected);
   }
@@ -323,27 +374,53 @@ export class LspRuntimeManager {
   private async prepareFilePositionTarget(
     filePath: string,
     line: number,
-    character: number,
-  ): Promise<SelectedServer & { client: LspClient; uri: string }> {
+    character: number | string,
+  ): Promise<
+    SelectedServer & { client: LspClient; uri: string; document: Readonly<LspClientDocument>; character: number }
+  > {
     const selected = await this.selectServerForFile(filePath);
-    validatePosition(selected, line, character);
-    return this.attachClient(selected);
+    try {
+      validatePosition(selected, line, typeof character === "string" ? 0 : character);
+    } catch (error) {
+      if (typeof character === "string" && error instanceof LspError && error.payload) {
+        throw new LspRuntimeError(error.message, error.code, {
+          ...error.payload,
+          requestedPosition: { line: line + 1, symbol: character },
+        });
+      }
+      throw error;
+    }
+    const resolvedCharacter =
+      typeof character === "string" ? resolveSymbol(selected.text, selected.filePath, line, character) : character;
+    return { ...(await this.attachClient(selected)), character: resolvedCharacter };
   }
 
-  private async attachClient(selected: SelectedServer): Promise<SelectedServer & { client: LspClient; uri: string }> {
+  private async attachClient(
+    selected: SelectedServer,
+  ): Promise<SelectedServer & { client: LspClient; uri: string; document: Readonly<LspClientDocument> }> {
     const target = await this.ensureClient({
       server: selected.server,
       rootDir: selected.rootDir,
       rootMarker: selected.rootMarker,
       allowPromptInstall: false,
     });
-    const uri = await target.client.syncFile(selected.filePath, selected.filetype, selected.text);
-    return { ...selected, client: target.client, uri };
+    const document = await target.client.syncDocument(selected.filePath, selected.filetype, selected.text);
+    return { ...selected, client: target.client, uri: document.uri, document };
   }
 
   private async selectServerForFile(filePath: string): Promise<SelectedServer> {
     const resolvedPath = this.resolvePath(filePath);
-    const text = await readFile(resolvedPath, "utf8");
+    let text: string;
+    try {
+      const [physicalRoot, physicalFile] = await Promise.all([realpath(this.cwd), realpath(resolvedPath)]);
+      if (!isPathInside(physicalRoot, physicalFile)) {
+        throw new LspRuntimeError("Refusing source access through a symlink outside workspace.", "outside-workspace");
+      }
+      text = await readFile(physicalFile, "utf8");
+    } catch (error) {
+      if (error instanceof LspError) throw error;
+      throw fileReadError(error, resolvedPath);
+    }
     const cached = this.filetypeCache.get(resolvedPath);
     const filetype = cached ?? detectFiletype({ path: resolvedPath, content: text });
     if (cached === undefined) {
@@ -412,6 +489,7 @@ export class LspRuntimeManager {
   }
 
   private async ensureClient(input: EnsureClientInput): Promise<ClientTarget> {
+    if (this.closed) throw new LspRuntimeError("LSP session shut down or was replaced.", "shutdown");
     const server = input.server;
     const rootDir = resolve(input.rootDir);
     const key = clientKey(server.id, rootDir);
@@ -445,6 +523,7 @@ export class LspRuntimeManager {
     });
     let client: LspClient | undefined;
     try {
+      if (this.closed) throw new LspRuntimeError("LSP session shut down before server startup.", "shutdown");
       client = new LspClient({
         id: input.key,
         ownerId: this.ownerId,
@@ -456,12 +535,14 @@ export class LspRuntimeManager {
         shutdownGraceMs: this.shutdownGraceMs,
       });
       await client.start();
+      if (this.closed) throw new LspRuntimeError("LSP session shut down during server startup.", "shutdown");
       this.clients.set(input.key, client);
       return { client, serverId: input.server.id, rootDir: input.rootDir, started: true };
     } catch (error) {
       await client?.shutdown().catch(() => false);
+      if (error instanceof LspError) throw error;
       throw new LspRuntimeError(
-        `Failed to start ${input.server.id}: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to start ${input.server.id}. Check /lsp doctor and the server configuration.`,
         "start-failed",
       );
     }
@@ -524,29 +605,35 @@ function isPathInside(rootDir: string, targetPath: string): boolean {
 
 function validatePosition(selected: SelectedServer, line: number, character: number): void {
   const lines = splitLines(selected.text);
+  const payload = {
+    filePath: selected.filePath,
+    requestedPosition: { line: line + 1, column: character + 1 },
+    fileLineCount: lines.length,
+    ...(Number.isInteger(line) && line >= 0 && line < lines.length
+      ? { validColumnRange: { minimum: 1, maximum: lines[line]!.length + 1 } }
+      : {}),
+    context: sourceContext(selected.text, line),
+  };
   if (!Number.isInteger(line) || !Number.isInteger(character) || line < 0 || character < 0) {
     throw new LspRuntimeError(
-      `Invalid LSP position for ${selected.filePath}. Use a valid 1-based line/column from the file and place the column on an identifier token.`,
+      `Invalid LSP position for ${selected.filePath}. Use integer 1-based line/column.`,
       "invalid-position",
+      payload,
     );
   }
-
   if (line >= lines.length) {
     throw new LspRuntimeError(
-      `Position is outside ${selected.filePath}: line ${line + 1} was requested, but the file has ${lines.length} line(s). Use a valid 1-based line/column from the file and place the column on an identifier token.`,
+      `Position is outside ${selected.filePath}: line ${line + 1} was requested, but the file has ${lines.length} line(s).`,
       "invalid-position",
+      payload,
     );
   }
-
-  const maxCharacter = lines[line]?.length ?? 0;
+  const maxCharacter = lines[line]!.length;
   if (character > maxCharacter) {
     throw new LspRuntimeError(
-      `Position is outside ${selected.filePath}: column ${character + 1} was requested on line ${line + 1}, but the maximum column is ${maxCharacter + 1}. Place the column on the identifier token you want to inspect.`,
+      `Position is outside ${selected.filePath}: column ${character + 1} was requested on line ${line + 1}, but the maximum column is ${maxCharacter + 1}.`,
       "invalid-position",
+      payload,
     );
   }
-}
-
-function splitLines(text: string): string[] {
-  return text.split(/\r\n|\r|\n/u);
 }

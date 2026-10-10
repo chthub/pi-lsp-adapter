@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { LspError } from "../lsp/errors.js";
+import { failure, type LspToolResult } from "./lspFormat.js";
 
 export const MAX_LSP_RESULT_CACHE_BYTES = 64 * 1024 * 1024;
 export const MAX_LSP_RESULT_CACHE_ENTRIES = 128;
@@ -80,25 +82,17 @@ export class LspResultCache {
     return this.entries.has(entry.id) ? entry.id : undefined;
   }
 
-  next(resultId: string): { content: [{ type: "text"; text: string }]; details: unknown } {
+  next(resultId: string): LspToolResult<unknown> {
     if (!isLspResultId(resultId)) {
-      return toolResult("Invalid LSP resultId format. Use the exact resultId from a previous paginated LSP result.", {
-        ok: false,
-        error: "invalid-result-id",
-      });
+      const result = failure("lsp_more", new LspError("Invalid LSP resultId format.", "invalid-result-id"));
+      return { ...result, details: { ...result.details, error: "invalid-result-id" } };
     }
 
     this.evictExpired();
     const entry = this.entries.get(resultId);
     if (!entry) {
-      return toolResult(
-        "Cached LSP result not found or expired. Re-run the original LSP query to get a fresh resultId.",
-        {
-          ok: false,
-          resultId,
-          error: "not-found",
-        },
-      );
+      const result = failure("lsp_more", new LspError("Cached LSP result not found or expired.", "expired-result-id"));
+      return { ...result, details: { ...result.details, resultId, error: "not-found" } };
     }
 
     entry.accessedAt = this.now();

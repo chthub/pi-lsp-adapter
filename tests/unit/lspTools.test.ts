@@ -31,7 +31,7 @@ type Tool = {
 describe("LSP tools", () => {
   it("converts 1-based tool positions to 0-based LSP positions", () => {
     expect(toLspPosition({ line: 7, column: 3 })).toEqual({ line: 6, character: 2 });
-    expect(toLspPosition({ line: 0, column: -1 })).toEqual({ line: 0, character: 0 });
+    expect(toLspPosition({ line: 0, column: -1 })).toEqual({ line: -1, character: -2 });
   });
 
   it("passes converted positions to the runtime manager", async () => {
@@ -81,6 +81,10 @@ describe("LSP tools", () => {
       rootDir: "/repo",
       filePath: "/repo/src/index.ts",
       uri: "file:///repo/src/index.ts",
+      status: "unverified",
+      received: true,
+      targetVersion: 1,
+      diskCheck: "matched",
       diagnostics: [
         {
           range: { start: { line: 2, character: 4 }, end: { line: 2, character: 8 } },
@@ -208,7 +212,7 @@ describe("LSP tools", () => {
 
     const result = await tool?.execute("tool-1", { resultId: "not-a-real-id" } as never);
     expect(result?.content[0]?.text).toContain("Invalid LSP resultId format");
-    expect(result?.details).toEqual({ ok: false, error: "invalid-result-id" });
+    expect(result?.details).toMatchObject({ ok: false, category: "invalid-result-id", retryable: false });
   });
 
   it("ranks diagnostics by severity and paginates details", () => {
@@ -219,6 +223,10 @@ describe("LSP tools", () => {
         rootDir: "/repo",
         filePath: "/repo/src/index.ts",
         uri: "file:///repo/src/index.ts",
+        status: "unverified",
+        received: true,
+        targetVersion: 1,
+        diskCheck: "matched",
         diagnostics: [
           {
             range: { start: { line: 9, character: 0 }, end: { line: 9, character: 1 } },
