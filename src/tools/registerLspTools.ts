@@ -37,7 +37,8 @@ const positionProperties = {
     Type.String({
       minLength: 1,
       maxLength: 256,
-      pattern: "^[$_\\p{ID_Start}][$\\p{ID_Continue}\\u200c\\u200d]*$",
+      // Provider schema validators may reject JS Unicode property escapes. Keep
+      // identifier syntax validation in validateSymbol(), before any LSP request.
       description:
         "Single identifier on this line (not a path/expression). Unique lexical match required; ambiguity fails. Provide symbol OR column.",
     }),

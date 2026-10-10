@@ -14,6 +14,7 @@ import {
   type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { convertResponsesTools } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { registerLspTools } from "../../src/tools/registerLspTools.js";
 import { LspError } from "../../src/lsp/errors.js";
 import { sourceContext } from "../../src/lsp/sourceContext.js";
@@ -127,6 +128,37 @@ async function hostCall(name: string, args: AgentToolCallOutcome["toolCall"]["ar
 }
 
 describe("Pi host error and selector integration (offline)", () => {
+  it("does not export JS Unicode identifier regexes to Codex tool schemas", () => {
+    // Exercise the actual converter used by Pi's Codex request builder. This is an
+    // offline payload regression, not a claim to run the provider's server validator.
+    const declarations = convertResponsesTools(
+      tools.filter((tool) => tool.name !== "codemode"),
+      { strict: null },
+    );
+    for (const name of ["lsp_hover", "lsp_definition", "lsp_references"]) {
+      const declaration = declarations.find((tool) => "name" in tool && tool.name === name);
+      expect(declaration).toBeDefined();
+      expect(declaration?.type).toBe("function");
+      if (!declaration || declaration.type !== "function") throw new Error("Missing function declaration");
+      expect(declaration.parameters).toMatchObject({
+        properties: { symbol: { type: "string", minLength: 1, maxLength: 256 } },
+      });
+      const schema = declaration.parameters as { properties: { symbol: Record<string, unknown> } };
+      expect(schema.properties.symbol).not.toHaveProperty("pattern");
+    }
+    expect(JSON.stringify(declarations)).not.toMatch(/ID_Start|ID_Continue/u);
+  });
+
+  it.each(["lsp_hover", "lsp_definition", "lsp_references"])(
+    "still rejects expression symbols locally for %s without a provider-facing regex",
+    async (name) => {
+      const outcome = await hostCall(name, { filePath: "a.ts", line: 1, symbol: "object.fit" });
+      expect(outcome.isError).toBe(true);
+      expect(outcome.result.details).toMatchObject({ ok: false, category: "invalid-selector" });
+      expect(calls).toEqual([]);
+    },
+  );
+
   it.each(["lsp_hover", "lsp_definition", "lsp_references"])(
     "accepts both legal selectors for %s through real host validation",
     async (name) => {

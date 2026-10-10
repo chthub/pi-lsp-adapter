@@ -123,6 +123,8 @@ Provide **exactly one** of `column` or `symbol`. A symbol must be a single ident
 
 Multiple lexical matches produce `ambiguous-symbol` with at most 32 candidate coordinates; none produces `symbol-not-found`. Retry with an explicit candidate column rather than expecting the tool to pick the first match. Comments and strings are not parsed out: matching text there can cause ambiguity. This does not repair wrong line numbers or prove a lexical match is the intended semantic symbol. The client advertises UTF-16 only and rejects a server that selects another encoding.
 
+Identifier syntax is checked locally before any LSP request. The provider-facing symbol schema deliberately omits a regex `pattern`: Codex schema validation rejects the JavaScript Unicode property escapes used by the local identifier matcher. Unicode identifier support and ambiguity checks remain unchanged.
+
 Pi 1.1.0 truncates fractional inputs for TypeBox `Integer` schemas. Position schemas therefore use `number` with `multipleOf: 1` and `minimum: 1`, preserving the integer-only contract without silently moving fractional coordinates. The adapter itself never clamps or truncates positions.
 
 ### Failures and recovery
