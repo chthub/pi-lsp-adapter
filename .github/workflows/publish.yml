@@ -27,7 +27,8 @@ jobs:
   npm:
     name: Publish to npm
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push') }}
+    # Forks must never publish the upstream npm package, even on manual dispatch.
+    if: ${{ github.repository == 'nikmmd/pi-lsp-adapter' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')) }}
 
     steps:
       - name: Resolve publish ref

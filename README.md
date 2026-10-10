@@ -15,19 +15,23 @@ Agents make better edits when they can ask semantic questions instead of guessin
 
 LSP already answers those questions. This extension makes those answers available to Pi as compact, read-only tools. It starts servers only when needed, keeps missing-server installs explicit by default, and returns the first useful page instead of dumping thousands of references into the model.
 
+## Compatibility
+
+This fork is tested with **Pi 1.1.0** and uses its structured `before_agent_start.systemPromptOptions.sections` API. Older Pi versions without that API are not supported; there is deliberately no whole-prompt replacement fallback. Development dependencies pin the Pi SDK to 1.1.0 so typechecks and offline regression tests use the target API.
+
+The four imported host libraries (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`) are wildcard peers, not runtime dependencies. Pi supplies them when loading the extension; development copies are not bundled in the package.
+
 ## Install
 
-Install from npm:
+This is [chthub's fork](https://github.com/chthub/pi-lsp-adapter) of [Nikmmd's original adapter](https://github.com/nikmmd/pi-lsp-adapter). It is not published to the upstream npm package. Install the fork from git:
 
 ```bash
-pi install npm:pi-lsp-adapter
+pi install git:github.com/chthub/pi-lsp-adapter
 ```
 
-Or install directly from git:
+For reproducibility, append `@<commit-or-tag>` to the git source. The upstream `npm:pi-lsp-adapter` source does not include this fork's fixes.
 
-```bash
-pi install git:github.com/nikmmd/pi-lsp-adapter
-```
+Before switching, back up your Pi settings and replace the old adapter package entry rather than loading both copies. Keep the old package source for rollback; do not delete LSP configuration, server installs, or session history. If several launch profiles share the same settings file, switching that file changes all of them.
 
 Restart Pi after installation, then check the extension:
 
@@ -38,10 +42,11 @@ Restart Pi after installation, then check the extension:
 For local development from a checkout:
 
 ```bash
-git clone https://github.com/nikmmd/pi-lsp-adapter.git
+git clone https://github.com/chthub/pi-lsp-adapter.git
 cd pi-lsp-adapter
-npm install
-pi -e "$PWD"
+npm ci
+# Isolate this trial from installed extensions, including the upstream adapter.
+pi --no-extensions -e "$PWD"
 ```
 
 The default install mode is `prompt`: agent tool calls will not silently install missing language servers. Install servers explicitly with `/lsp install <serverId>`, or set `installMode` to `auto` if you want first-use installation.
@@ -410,7 +415,9 @@ Interactive `/lsp` panel keys:
 
 ## How it works
 
-- The extension adds read-only LSP tools and prompt guidance to Pi.
+- The extension adds read-only LSP tools and stable guidance in the named `lsp_integration` prompt section after successful session initialization.
+- It neither returns a complete `systemPrompt` nor sets `forceSystemPrompt`. Pi can therefore retain native prompt/tool deltas, including dynamically enabled tools at their historical position, on transports that support them.
+- Transports without dynamic tool declarations still use Pi's full-tool compatibility fallback. Other extensions that force a complete system prompt can still collapse request history; this fix is not a guarantee of prompt-cache hits.
 - File requests are resolved by filetype and nearest project root marker.
 - Server definitions come from the built-in catalog plus global/project config.
 - Missing-server behavior follows `installMode`; read warmup never installs missing servers.
@@ -423,39 +430,25 @@ Interactive `/lsp` panel keys:
 
 ## Development
 
+Use Node.js 22.19.0 or newer and install the locked development dependencies with `npm ci`.
+
 ```bash
+npm ci
 npm run format:check
 npm run lint
 npm run typecheck
 npm test
 ```
 
-For local development with Pi:
+Tests are offline: they initialize the adapter in temporary directories, load it through Pi's real extension loader/runner, and exercise Pi's actual prompt projection and transcript tool resolution with synthetic history. They cover additive transports, the independent unsupported-additions fallback, and the old forced-prompt behavior as a positive control. No model requests or real language-server installs are needed.
 
-```bash
-mkdir -p ~/.pi/agent/extensions
-ln -sfnT "$PWD" ~/.pi/agent/extensions/pi-lsp-adapter
-pi
-```
+For persistent local development, replace the old adapter entry in the `packages` array of your Pi settings with the checkout's absolute path (or a path relative to the settings file). Install dependencies in that checkout first. Do not also register it through an extensions symlink or retain the npm copy.
 
-Run `/reload` in Pi after editing the extension.
+Run `/reload` after source edits. Updating Pi itself requires restarting with the new executable; `/reload` only reloads extensions. Restore the old source entry to roll back.
 
-## Release
+## Release policy
 
-Publishing is CI-driven. Do not create release tags by hand. To cut a release, make a normal commit that bumps `package.json` and `package-lock.json`; after that commit lands on `main` and CI passes, `.github/workflows/publish.yml` creates the matching semver tag and publishes to npm.
-
-npm publishing uses Trusted Publishing for `.github/workflows/publish.yml`, so no npm token secret is required. The npm package must have a Trusted Publisher configured for `nikmmd/pi-lsp-adapter` and workflow filename `publish.yml`.
-
-```bash
-npm version 0.1.2 --no-git-tag-version
-git add package.json package-lock.json
-git commit -m "chore: release v0.1.2"
-git push origin main
-```
-
-Non-release pushes to `main` also trigger the publish workflow, but it exits without publishing when the current `package.json` version already exists on npm.
-
-Stable versions such as `0.1.2` publish with the npm `latest` dist-tag. Prerelease versions such as `0.2.0-beta.1` publish with the npm `next` dist-tag.
+This fork is distributed through git or a local checkout. Its manifest is `private: true` to block accidental npm publication under the upstream name. The retained upstream publish workflow is guarded to run only in `nikmmd/pi-lsp-adapter`, including manual dispatch, and is disabled in forks. Do not configure publishing credentials for this fork. Any future npm release requires a separate package name and an explicitly reviewed release process.
 
 ## Troubleshooting
 
@@ -507,4 +500,4 @@ This only removes Pi-managed install state. It does not remove external system/M
 
 ## License
 
-[MIT](https://opensource.org/license/MIT) © 2026 pi-lsp-adapter developers
+[MIT](LICENSE) © 2026 pi-lsp-adapter developers. Original author: Nikmmd. Fork changes retain the original attribution and license.

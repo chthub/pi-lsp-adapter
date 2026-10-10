@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { BeforeAgentStartEvent } from "@earendil-works/pi-coding-agent";
 import extension from "../../src/index.js";
 
 type Handler = (event: unknown, ctx: FakeContext) => Promise<unknown> | unknown;
@@ -60,16 +61,99 @@ describe("extension entrypoint", () => {
     const ctx = fakeContext();
     await pi.handlers.get("session_start")?.({ reason: "startup" }, ctx);
     await pi.commands.get("lsp")?.handler("status", ctx);
-    const beforeAgent = await pi.handlers.get("before_agent_start")?.({ systemPrompt: "base" }, ctx);
+    const event = beforeAgentEvent();
+    const beforeAgent = await pi.handlers.get("before_agent_start")?.(event, ctx);
 
     expect(ctx.ui.statuses.lsp).toMatch(/LSP: 0\/\d+ servers/u);
     expect(ctx.ui.notifications.at(-1)?.message).toContain("LSP status");
-    expect(beforeAgent).toMatchObject({ systemPrompt: expect.stringContaining("LSP integration") });
+    expect(beforeAgent).toBeUndefined();
+    expect(event.systemPromptOptions.sections.lsp_integration).toContain("LSP integration");
+    expect(event.systemPromptOptions.forceSystemPrompt).toBeUndefined();
 
     await pi.handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
     expect(ctx.ui.statuses.lsp).toBeUndefined();
   });
+
+  it("leaves the prompt untouched before initialization and after shutdown", async () => {
+    const pi = fakePi();
+    extension(pi.api);
+    const ctx = fakeContext();
+    const handler = pi.handlers.get("before_agent_start");
+    expect(handler).toBeDefined();
+    const event = beforeAgentEvent();
+    const original = structuredClone(event);
+
+    expect(await handler?.(event, ctx)).toBeUndefined();
+    expect(event).toEqual(original);
+    await pi.handlers.get("session_start")?.({ reason: "startup" }, ctx);
+    const initialized = beforeAgentEvent();
+    await handler?.(initialized, ctx);
+    expect(initialized.systemPromptOptions.sections.lsp_integration).toContain("LSP integration");
+    await pi.handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+    expect(await handler?.(event, ctx)).toBeUndefined();
+    expect(event).toEqual(original);
+  });
+
+  it("changes only its named section and stays stable across repeated runs", async () => {
+    const pi = fakePi();
+    extension(pi.api);
+    const ctx = fakeContext();
+    await pi.handlers.get("session_start")?.({ reason: "startup" }, ctx);
+    // Assert successful initialization, not merely the !state early return.
+    expect(ctx.ui.statuses.lsp).toMatch(/LSP: 0\/\d+ servers/u);
+    const handler = pi.handlers.get("before_agent_start");
+    expect(handler).toBeDefined();
+    const event = beforeAgentEvent();
+    const original = structuredClone(event);
+
+    expect(await handler?.(event, ctx)).toBeUndefined();
+    const guidance = event.systemPromptOptions.sections.lsp_integration;
+    expect(guidance).toContain("read-only LSP tools");
+    expect(guidance).toContain("1-based line/column");
+    expect(guidance).toContain("identifier token itself");
+    expect(guidance).toContain("resultId is missing or expired");
+    expect(event).toEqual({
+      ...original,
+      systemPromptOptions: {
+        ...original.systemPromptOptions,
+        sections: { ...original.systemPromptOptions.sections, lsp_integration: guidance },
+      },
+    });
+
+    const once = structuredClone(event);
+    for (let run = 0; run < 3; run++) {
+      expect(await handler?.(event, ctx)).toBeUndefined();
+      expect(event).toEqual(once);
+      const fresh = { ...beforeAgentEvent(), systemPrompt: `Different rendered prompt ${run}` };
+      fresh.systemPromptOptions.selectedTools.push(`new_tool_${run}`);
+      await handler?.(fresh, ctx);
+      expect(fresh.systemPromptOptions.sections.lsp_integration).toBe(guidance);
+      expect(fresh.systemPromptOptions.forceSystemPrompt).toBeUndefined();
+    }
+    await pi.handlers.get("session_shutdown")?.({ reason: "quit" }, ctx);
+  });
 });
+
+function beforeAgentEvent(): BeforeAgentStartEvent {
+  return {
+    type: "before_agent_start",
+    prompt: "Synthetic question",
+    systemPrompt: "base",
+    systemPromptOptions: {
+      cwd: tempProject,
+      customPrompt: "base",
+      appendSystemPrompt: "Existing appended instructions",
+      selectedTools: ["read", "lsp_hover"],
+      hiddenTools: [],
+      toolSnippets: { lsp_hover: "Read-only hover" },
+      toolGuidelines: { lsp_hover: ["Existing tool guidance"] },
+      promptGuidelines: ["Existing prompt guidance"],
+      sections: { other_extension: "Keep this section" },
+      contextFiles: [],
+      skills: [],
+    },
+  };
+}
 
 function fakePi(): {
   api: never;

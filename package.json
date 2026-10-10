@@ -1,17 +1,18 @@
 {
   "name": "pi-lsp-adapter",
   "version": "0.1.3",
+  "private": true,
   "description": "Pi extension that gives coding agents Language Server Protocol tools for diagnostics, hover, definitions, references, and symbol search",
   "author": "Nikmmd",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nikmmd/pi-lsp-adapter.git"
+    "url": "git+https://github.com/chthub/pi-lsp-adapter.git"
   },
-  "homepage": "https://github.com/nikmmd/pi-lsp-adapter#readme",
+  "homepage": "https://github.com/chthub/pi-lsp-adapter#readme",
   "bugs": {
-    "url": "https://github.com/nikmmd/pi-lsp-adapter/issues"
+    "url": "https://github.com/chthub/pi-lsp-adapter/issues"
   },
   "keywords": [
     "pi-package",
@@ -46,15 +47,15 @@
     ]
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "^0.74.1",
-    "typebox": "^1.1.38",
     "vscode-jsonrpc": "^8.2.1",
     "vscode-languageserver-protocol": "^3.17.5",
     "vscode-uri": "^3.0.8"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-ai": {
@@ -62,10 +63,19 @@
     },
     "@earendil-works/pi-coding-agent": {
       "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.2",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
+    "typebox": "1.3.27",
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.15.0",
     "@vitest/coverage-v8": "^4.1.7",

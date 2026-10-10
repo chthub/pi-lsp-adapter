@@ -13,6 +13,9 @@ import { LspResultCache } from "./tools/resultCache.js";
 import { setLspStatusLine } from "./statusLine.js";
 import type { LspExtensionState } from "./state.js";
 
+const LSP_GUIDANCE =
+  'LSP integration: read-only LSP tools are available for diagnostics, hover/type info, definitions, references, document symbols, and workspace symbol search. Prefer these tools when semantic code understanding would reduce guesswork; they use 1-based line/column inputs and do not mutate files. For hover, definition, and references, place the column on the identifier token itself. When an LSP result says "More available" and includes a resultId, use lsp_more only if you need the next sequential page; re-run the original LSP query if the resultId is missing or expired.';
+
 export default function piAgentLspExtension(pi: ExtensionAPI): void {
   let state: LspExtensionState | null = null;
   let generation = 0;
@@ -23,9 +26,8 @@ export default function piAgentLspExtension(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event) => {
     if (!state) return;
-    return {
-      systemPrompt: `${event.systemPrompt}\n\nLSP integration: read-only LSP tools are available for diagnostics, hover/type info, definitions, references, document symbols, and workspace symbol search. Prefer these tools when semantic code understanding would reduce guesswork; they use 1-based line/column inputs and do not mutate files. For hover, definition, and references, place the column on the identifier token itself. When an LSP result says "More available" and includes a resultId, use lsp_more only if you need the next sequential page; re-run the original LSP query if the resultId is missing or expired.`,
-    };
+    // Keep Pi's native prompt/tool deltas instead of forcing a complete prompt projection.
+    event.systemPromptOptions.sections.lsp_integration = LSP_GUIDANCE;
   });
 
   pi.on("session_start", async (_event, ctx) => {
