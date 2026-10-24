@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -144,6 +145,37 @@ describe("LspRuntimeManager", () => {
     expect(spawner).not.toHaveBeenCalled();
     const explicit = await runtime.hover("src/index.ts", 0, 10);
     expect(explicit.resolvedPosition).toEqual({ line: 1, column: 11 });
+  });
+
+  it("accepts files in sibling git worktrees at the same subdirectory, and nothing else", async () => {
+    const repo = join(tempDir, "repo");
+    const worktree = join(tempDir, "repo-wt");
+    await mkdir(join(repo, "pkg", "src"), { recursive: true });
+    await mkdir(join(repo, "other"), { recursive: true });
+    await writeFile(join(repo, "pkg", "package.json"), "{}\n");
+    await writeFile(join(repo, "pkg", "src", "index.ts"), "export const a = 1;\n");
+    await writeFile(join(repo, "other", "index.ts"), "export const b = 1;\n");
+    const git = (...args: string[]) =>
+      execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", ...args], {
+        cwd: repo,
+        stdio: "ignore",
+      });
+    git("init", "-q");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+    git("worktree", "add", "-q", worktree);
+    await writeFile(join(tempDir, "unrelated.ts"), "export const c = 1;\n");
+
+    const runtime = runtimeManager({ cwd: join(repo, "pkg") });
+    const result = await runtime.diagnostics(join(worktree, "pkg", "src", "index.ts"));
+    expect(result).toMatchObject({ rootDir: join(worktree, "pkg"), diskCheck: "matched" });
+    await expect(runtime.hover(join(worktree, "other", "index.ts"), 0, 0)).rejects.toMatchObject({
+      code: "outside-workspace",
+    });
+    await expect(runtime.hover(join(tempDir, "unrelated.ts"), 0, 0)).rejects.toMatchObject({
+      code: "outside-workspace",
+    });
+    await runtime.shutdown();
   });
 
   it("refuses symlink escapes without disclosing outside source", async () => {
@@ -350,6 +382,7 @@ function runtimeManager(
     spawner?: () => LspServerProcess;
     connectionFactory?: (process: LspServerProcess) => LspConnection;
     installManager?: LspInstallManager;
+    cwd?: string;
   } = {},
 ): LspRuntimeManager & {
   registry: LspProcessRegistry;
@@ -361,7 +394,7 @@ function runtimeManager(
     terminateGraceMs: 0,
   });
   const runtime = new LspRuntimeManager({
-    cwd: projectDir,
+    cwd: options.cwd ?? projectDir,
     ownerId: "owner-test",
     config: config(options.installMode ?? "auto"),
     installManager: options.installManager ?? fakeInstallManager(options.installed ?? true),

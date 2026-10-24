@@ -300,6 +300,34 @@ describe("request-confirmed diagnostics", () => {
     await client.start();
   }
 
+  it.each([
+    [{ change: 2 }, true],
+    [2, true],
+    [{ change: 1 }, false],
+    [undefined, false],
+  ])("sends whole-document range changes only to incremental servers (%j)", async (textDocumentSync, ranged) => {
+    await restart(textDocumentSync === undefined ? {} : { textDocumentSync });
+    await document("a\r\nb 😀\n");
+    await document("a\n");
+    const change = connection.notifications.find((entry) => entry.method === "textDocument/didChange")?.params;
+    expect(change).toEqual({
+      textDocument: { uri: expect.any(String), version: 2 },
+      contentChanges: [
+        ranged
+          ? { range: { start: { line: 0, character: 0 }, end: { line: 2, character: 0 } }, text: "a\n" }
+          : { text: "a\n" },
+      ],
+    });
+    await document("x\ny 😀");
+    expect(connection.notifications.at(-1)?.params).toMatchObject({
+      contentChanges: [ranged ? { range: { end: { line: 1, character: 0 } } } : { text: "x\ny 😀" }],
+    });
+    await document("z");
+    expect(connection.notifications.at(-1)?.params).toMatchObject({
+      contentChanges: [ranged ? { range: { end: { line: 1, character: 4 } } } : { text: "z" }],
+    });
+  });
+
   it("declares dynamic pull support and pulls once the server registers it", async () => {
     expect(connection.requests[0]?.params).toMatchObject({
       capabilities: { textDocument: { diagnostic: { dynamicRegistration: true } } },

@@ -20,6 +20,7 @@ import {
   PublishDiagnosticsNotification,
   ReferencesRequest,
   ShutdownRequest,
+  TextDocumentSyncKind,
   DocumentSymbolRequest,
   WorkspaceSymbolRequest,
   type Definition,
@@ -42,6 +43,7 @@ import {
 import { URI } from "vscode-uri";
 import { getLogsDir } from "../config/paths.js";
 import { LspError } from "./errors.js";
+import { splitLines } from "./sourceContext.js";
 import type { JsonObject, JsonValue, ResolvedServerConfig } from "../registry/schema.js";
 import type { LspProcessRegistry } from "./processRegistry.js";
 
@@ -232,7 +234,13 @@ export class LspClient {
     } else {
       await this.connection.sendNotification(DidChangeTextDocumentNotification.method, {
         textDocument: { uri, version: document.version },
-        contentChanges: [{ text }],
+        // vtsls (incremental sync) mis-applies rangeless full-text changes that remove trailing lines,
+        // so incremental servers get an explicit whole-document range instead.
+        contentChanges: [
+          this.incrementalSync()
+            ? { range: { start: { line: 0, character: 0 }, end: endPosition(existing.text) }, text }
+            : { text },
+        ],
       });
     }
     return { ...document };
@@ -277,6 +285,11 @@ export class LspClient {
       if (error instanceof LspError && ["cancelled", "shutdown", "server-exited"].includes(error.code)) throw error;
       return this.waitForDiagnostics(document, Math.max(0, deadline - Date.now()), signal);
     }
+  }
+
+  private incrementalSync(): boolean {
+    const sync = this.capabilities?.textDocumentSync;
+    return (typeof sync === "number" ? sync : sync?.change) === TextDocumentSyncKind.Incremental;
   }
 
   private diagnosticRequestRoute(): DiagnosticRequestRoute | undefined {
@@ -727,6 +740,12 @@ function tsserverPosition(value: unknown): { line: number; character: number } |
   const line = (value.line as number) - 1;
   const character = (value.offset as number) - 1;
   return line >= 0 && character >= 0 ? { line, character } : undefined;
+}
+
+// End of `text` in LSP coordinates (UTF-16 code units).
+function endPosition(text: string): { line: number; character: number } {
+  const lines = splitLines(text);
+  return { line: lines.length - 1, character: lines.at(-1)!.length };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

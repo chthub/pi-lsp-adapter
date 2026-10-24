@@ -629,7 +629,7 @@ function conciseExpectedError(message: string): string {
   }
 
   if (/outside workspace/iu.test(trimmed)) {
-    return `${firstLine} Use a file under the current workspace.`;
+    return `${firstLine} Use a file under the current workspace or one of its git worktrees.`;
   }
 
   if (/timed out after \d+ms/iu.test(trimmed)) {

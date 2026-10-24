@@ -1,8 +1,10 @@
+import { execFile } from "node:child_process";
 import { readFile, realpath } from "node:fs/promises";
+import { promisify } from "node:util";
 import { LspError, fileReadError } from "./errors.js";
 import { sourceContext, splitLines } from "./sourceContext.js";
 import { resolveSymbol } from "./positionSelector.js";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 
 import type {
   Definition,
@@ -41,6 +43,8 @@ export interface LspRuntimeManagerOptions {
   requestTimeoutMs?: number;
   diagnosticsWaitMs?: number;
   shutdownGraceMs?: number;
+  /** Lists extra workspace roots for `cwd`; defaults to the same directory in sibling git worktrees. */
+  listWorktreeRoots?: (cwd: string) => Promise<string[]>;
 }
 
 export type LspStartStatus = "started" | "already-running" | "missing" | "declined" | "error";
@@ -121,6 +125,8 @@ export class LspRuntimeManager {
   private readonly requestTimeoutMs: number;
   private readonly diagnosticsWaitMs: number;
   private readonly shutdownGraceMs: number;
+  private readonly listWorktreeRoots: (cwd: string) => Promise<string[]>;
+  private workspaceRoots: Promise<string[]> | undefined;
   private readonly clients = new Map<string, LspClient>();
   private readonly starting = new Map<string, Promise<ClientTarget>>();
   private readonly filetypeCache = new Map<string, string>();
@@ -139,6 +145,7 @@ export class LspRuntimeManager {
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
     this.diagnosticsWaitMs = options.diagnosticsWaitMs ?? 1_000;
     this.shutdownGraceMs = options.shutdownGraceMs ?? 1_000;
+    this.listWorktreeRoots = options.listWorktreeRoots ?? gitWorktreeRoots;
   }
 
   async startServer(
@@ -221,9 +228,10 @@ export class LspRuntimeManager {
     const waitedMs = Date.now() - waitStartedAt;
     let diskCheck: LspDiagnosticsResult["diskCheck"] = "unavailable";
     try {
-      const [root, path] = await Promise.all([realpath(this.cwd), realpath(target.filePath)]);
-      if (isPathInside(root, path)) diskCheck = (await readFile(path, "utf8")) === target.text ? "matched" : "changed";
-      else diskCheck = "changed";
+      const path = await realpath(target.filePath);
+      if (await this.workspaceRootFor(path, true)) {
+        diskCheck = (await readFile(path, "utf8")) === target.text ? "matched" : "changed";
+      } else diskCheck = "changed";
     } catch {
       /* The source may have disappeared or become unreadable during the query. */
     }
@@ -415,10 +423,17 @@ export class LspRuntimeManager {
 
   private async selectServerForFile(filePath: string): Promise<SelectedServer> {
     const resolvedPath = this.resolvePath(filePath);
+    const workspaceRoot = await this.workspaceRootFor(resolvedPath);
+    if (!workspaceRoot) {
+      throw new LspRuntimeError(
+        `Refusing to start LSP for ${resolvedPath}; target is outside workspace ${this.cwd} and its git worktrees.`,
+        "outside-workspace",
+      );
+    }
     let text: string;
     try {
-      const [physicalRoot, physicalFile] = await Promise.all([realpath(this.cwd), realpath(resolvedPath)]);
-      if (!isPathInside(physicalRoot, physicalFile)) {
+      const physicalFile = await realpath(resolvedPath);
+      if (!(await this.workspaceRootFor(physicalFile, true))) {
         throw new LspRuntimeError("Refusing source access through a symlink outside workspace.", "outside-workspace");
       }
       text = await readFile(physicalFile, "utf8");
@@ -444,7 +459,7 @@ export class LspRuntimeManager {
     }
 
     const root = await detectRoot(resolvedPath, server.rootMarkers);
-    const rootDir = root && isPathInside(this.cwd, root.rootDir) ? root.rootDir : this.cwd;
+    const rootDir = root && isPathInside(workspaceRoot, root.rootDir) ? root.rootDir : workspaceRoot;
     return {
       server,
       rootDir,
@@ -588,14 +603,52 @@ export class LspRuntimeManager {
   }
 
   private resolvePath(filePath: string): string {
-    const resolvedPath = isAbsolute(filePath) ? resolve(filePath) : resolve(this.cwd, filePath);
-    if (!isPathInside(this.cwd, resolvedPath)) {
-      throw new LspRuntimeError(
-        `Refusing to start LSP for ${resolvedPath}; target is outside workspace ${this.cwd}.`,
-        "outside-workspace",
+    return isAbsolute(filePath) ? resolve(filePath) : resolve(this.cwd, filePath);
+  }
+
+  // Returns the most specific workspace root containing `path`: cwd or its counterpart in a sibling
+  // git worktree. `physical` compares against resolved real paths for symlink checks.
+  private async workspaceRootFor(path: string, physical = false): Promise<string | undefined> {
+    const find = async (roots: string[]) => {
+      const candidates = physical
+        ? await Promise.all(roots.map((root) => realpath(root).catch(() => undefined)))
+        : roots;
+      return candidates
+        .filter((root): root is string => root !== undefined && isPathInside(root, path))
+        .sort((a, b) => b.length - a.length)[0];
+    };
+    const load = () =>
+      this.listWorktreeRoots(this.cwd).then(
+        (roots) => [this.cwd, ...roots],
+        () => [this.cwd],
       );
-    }
-    return resolvedPath;
+    const found = await find(await (this.workspaceRoots ??= load()));
+    if (found) return found;
+    // Worktrees added after the first lookup are picked up on a miss.
+    this.workspaceRoots = load();
+    return find(await this.workspaceRoots);
+  }
+}
+
+const execFileAsync = promisify(execFile);
+
+async function gitWorktreeRoots(cwd: string): Promise<string[]> {
+  try {
+    const git = async (args: string[]) => (await execFileAsync("git", args, { cwd, timeout: 2_000 })).stdout.trim();
+    const [top, list, physicalCwd] = await Promise.all([
+      git(["rev-parse", "--show-toplevel"]),
+      git(["worktree", "list", "--porcelain"]),
+      realpath(cwd),
+    ]);
+    // Keep the same subdirectory scope as cwd inside each sibling worktree.
+    const offset = relative(await realpath(top), physicalCwd);
+    if (offset.startsWith("..") || isAbsolute(offset)) return [];
+    return list
+      .split("\n")
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => join(line.slice("worktree ".length), offset));
+  } catch {
+    return [];
   }
 }
 

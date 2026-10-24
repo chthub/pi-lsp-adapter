@@ -484,6 +484,7 @@ Interactive `/lsp` panel keys:
 - It neither returns a complete `systemPrompt` nor sets `forceSystemPrompt`. Pi can therefore retain native prompt/tool deltas, including dynamically enabled tools at their historical position, on transports that support them.
 - Transports without dynamic tool declarations still use Pi's full-tool compatibility fallback. Other extensions that force a complete system prompt can still collapse request history; this fix is not a guarantee of prompt-cache hits.
 - File requests are resolved by filetype and nearest project root marker.
+- Files must be under the session cwd or the same subdirectory of a sibling worktree listed by `git worktree list`; each worktree gets its own server root. Other paths, and symlinks resolving outside these roots, are refused.
 - Server definitions come from the built-in catalog plus global/project config.
 - Missing-server behavior follows `installMode`; read warmup never installs missing servers.
 - Servers start lazily over stdio and are tracked in a process registry.

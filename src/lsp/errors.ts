@@ -51,7 +51,8 @@ const RECOVERY: Partial<Record<LspErrorCode, string>> = {
   "not-installed": "Install the named server explicitly with /lsp install <serverId>, then query again.",
   declined: "Install the server explicitly if desired; do not repeat the unchanged query expecting installation.",
   "start-failed": "Check the server configuration and /lsp doctor before trying again.",
-  "outside-workspace": "Use a file under the current workspace; no source context is available.",
+  "outside-workspace":
+    "Use a file under the current workspace or one of its git worktrees; no source context is available.",
   "file-not-found": "Check filePath and try again after correcting it or creating the file.",
   "permission-denied": "Obtain file access permission before querying again.",
   "invalid-position": "Locate the intended symbol in this source before retrying with valid 1-based coordinates.",
