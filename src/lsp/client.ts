@@ -11,6 +11,8 @@ import {
   DefinitionRequest,
   DidChangeTextDocumentNotification,
   DidOpenTextDocumentNotification,
+  DocumentDiagnosticRequest,
+  ExecuteCommandRequest,
   ExitNotification,
   HoverRequest,
   InitializeRequest,
@@ -22,6 +24,8 @@ import {
   WorkspaceSymbolRequest,
   type Definition,
   type Diagnostic,
+  type DiagnosticTag,
+  type DocumentDiagnosticReport,
   type DocumentSymbol,
   type Hover,
   type InitializeParams,
@@ -87,8 +91,14 @@ export interface DiagnosticPublication {
   arrivedAt: number;
 }
 
+// "pull" and "tsserver" results answer a request sent after the version was synced; "push" is observed only.
+export type DiagnosticsSource = "pull" | "tsserver" | "push";
+
+type DiagnosticRequestRoute = { kind: "pull"; identifier?: string } | { kind: "tsserver" };
+
 export interface DiagnosticsSnapshot {
   status: "pending" | "fresh" | "stale" | "unverified";
+  source?: DiagnosticsSource;
   received: boolean;
   targetVersion: number;
   currentVersion?: number;
@@ -105,12 +115,15 @@ export interface LspDiagnosticsResult extends DiagnosticsSnapshot {
   filePath: string;
   uri: string;
   diskCheck: "matched" | "changed" | "unavailable";
+  waitBudgetMs?: number;
+  waitedMs?: number;
 }
 
 export class LspClient {
   readonly id: string;
   readonly serverId: string;
   readonly rootDir: string;
+  readonly diagnosticsWaitMs: number | undefined;
 
   private readonly config: ResolvedServerConfig;
   private readonly ownerId: string;
@@ -126,6 +139,15 @@ export class LspClient {
     { versioned?: DiagnosticPublication; unversioned?: DiagnosticPublication }
   >();
   private readonly diagnosticListeners = new Set<() => void>();
+  // Publication sequence at the latest sync; no-version publications at or before it predate that version.
+  private readonly syncSequenceByUri = new Map<string, number>();
+  // Request-confirmed diagnostics for one document version; preferred over pushes for that version.
+  private readonly requestedByUri = new Map<
+    string,
+    { version: number; diagnostics: Diagnostic[]; source: Exclude<DiagnosticsSource, "push"> }
+  >();
+  // Pyright registers pull diagnostics dynamically after `initialized` instead of advertising them.
+  private readonly pullRegistrations = new Map<string, { identifier?: string }>();
   private publicationSequence = 0;
   private stopping = false;
   private readonly documents = new Map<string, LspClientDocument>();
@@ -138,6 +160,7 @@ export class LspClient {
     this.id = options.id;
     this.serverId = options.config.server.id;
     this.rootDir = options.config.rootDir;
+    this.diagnosticsWaitMs = options.config.server.diagnosticsWaitMs;
     this.config = options.config;
     this.ownerId = options.ownerId;
     this.processRegistry = options.processRegistry;
@@ -200,6 +223,7 @@ export class LspClient {
     if (existing?.text === text) return { ...existing };
     const document = { uri, filePath, languageId, text, version: (existing?.version ?? 0) + 1 };
     this.documents.set(uri, document);
+    this.syncSequenceByUri.set(uri, this.publicationSequence);
     this.notifyDiagnosticListeners();
     if (!existing) {
       await this.connection.sendNotification(DidOpenTextDocumentNotification.method, {
@@ -221,18 +245,98 @@ export class LspClient {
     return unknown && (!known || unknown.sequence > known.sequence) ? unknown : known;
   }
 
+  /**
+   * Asks the server for this version's diagnostics when it offers a request route, falling back to
+   * waiting for a push within the same budget when the request fails or times out.
+   */
+  async collectDiagnostics(
+    document: Readonly<LspClientDocument>,
+    waitMs: number,
+    signal?: AbortSignal,
+  ): Promise<DiagnosticsSnapshot> {
+    if (waitMs <= 0) return this.waitForDiagnostics(document, 0, signal);
+    const deadline = Date.now() + waitMs;
+    let route = this.diagnosticRequestRoute();
+    if (!route) {
+      // A server that registers pull support mid-wait (pyright on cold start) stops pushing, so switch over.
+      const observed = await this.waitForDiagnostics(document, waitMs, signal, () => !!this.diagnosticRequestRoute());
+      route = this.diagnosticRequestRoute();
+      if (!route || observed.status === "fresh" || observed.currentVersion !== document.version) return observed;
+    }
+    try {
+      const diagnostics = await untilAborted(
+        this.requestDiagnostics(route, document, Math.max(1, deadline - Date.now())),
+        signal,
+      );
+      if (this.documents.get(document.uri)?.version === document.version) {
+        this.requestedByUri.set(document.uri, { version: document.version, diagnostics, source: route.kind });
+        this.notifyDiagnosticListeners();
+      }
+      return this.waitForDiagnostics(document, 0, signal);
+    } catch (error) {
+      if (error instanceof LspError && ["cancelled", "shutdown", "server-exited"].includes(error.code)) throw error;
+      return this.waitForDiagnostics(document, Math.max(0, deadline - Date.now()), signal);
+    }
+  }
+
+  private diagnosticRequestRoute(): DiagnosticRequestRoute | undefined {
+    const provider = this.capabilities?.diagnosticProvider;
+    if (provider) return { kind: "pull", identifier: provider.identifier };
+    const registered = this.pullRegistrations.values().next();
+    if (!registered.done) return { kind: "pull", identifier: registered.value.identifier };
+    if (this.capabilities?.executeCommandProvider?.commands.includes(TSSERVER_REQUEST_COMMAND)) {
+      return { kind: "tsserver" };
+    }
+    return undefined;
+  }
+
+  private async requestDiagnostics(
+    route: DiagnosticRequestRoute,
+    document: Readonly<LspClientDocument>,
+    timeoutMs: number,
+  ): Promise<Diagnostic[]> {
+    if (route.kind === "pull") {
+      const report = await this.request<DocumentDiagnosticReport | null>(
+        DocumentDiagnosticRequest.method,
+        { textDocument: { uri: document.uri }, ...(route.identifier ? { identifier: route.identifier } : {}) },
+        timeoutMs,
+      );
+      // No previousResultId is sent, so only a full report can describe this version.
+      if (report?.kind !== "full" || !Array.isArray(report.items)) {
+        throw new Error(`${this.serverId} returned no full diagnostic report.`);
+      }
+      return report.items;
+    }
+    const deadline = Date.now() + timeoutMs;
+    const diagnostics: Diagnostic[] = [];
+    for (const command of TSSERVER_DIAGNOSTIC_COMMANDS) {
+      const response = await this.request<unknown>(
+        ExecuteCommandRequest.method,
+        { command: TSSERVER_REQUEST_COMMAND, arguments: [command, { file: document.filePath }] },
+        Math.max(1, deadline - Date.now()),
+      );
+      diagnostics.push(...tsserverDiagnostics(response, command));
+    }
+    return diagnostics;
+  }
+
   async waitForDiagnostics(
     document: Readonly<LspClientDocument>,
     waitMs: number,
     signal?: AbortSignal,
+    stopWhen?: () => boolean,
   ): Promise<DiagnosticsSnapshot> {
     const check = (): DiagnosticsSnapshot => {
       if (signal?.aborted) throw new LspError("Diagnostic query cancelled.", "cancelled");
       this.ensureActive();
       return this.diagnosticSnapshot(document);
     };
+    // Unverified means a no-version publication arrived after this version was sent; older ones stay stale.
     const ready = (snapshot: DiagnosticsSnapshot) =>
-      snapshot.status === "fresh" || snapshot.status === "unverified" || snapshot.currentVersion !== document.version;
+      snapshot.status === "fresh" ||
+      snapshot.status === "unverified" ||
+      snapshot.currentVersion !== document.version ||
+      stopWhen?.() === true;
     const initial = check();
     if (ready(initial) || waitMs <= 0) return initial;
     return new Promise((resolvePromise, reject) => {
@@ -277,13 +381,31 @@ export class LspClient {
     const publication = this.getDiagnostics(document.uri);
     const currentVersion = this.documents.get(document.uri)?.version;
     const drifted = currentVersion !== document.version;
+    const knownPublicationVersion = this.diagnosticsByUri.get(document.uri)?.versioned?.version;
+    const requested = this.requestedByUri.get(document.uri);
+    if (!drifted && requested?.version === document.version) {
+      return {
+        status: "fresh",
+        source: requested.source,
+        received: true,
+        targetVersion: document.version,
+        currentVersion,
+        publicationVersion: requested.version,
+        knownPublicationVersion,
+        diagnostics: requested.diagnostics,
+      };
+    }
+    const syncSequence = this.syncSequenceByUri.get(document.uri) ?? 0;
     return {
+      source: "push",
       status: drifted
         ? "stale"
         : !publication
           ? "pending"
           : publication.version === undefined
-            ? "unverified"
+            ? publication.sequence > syncSequence
+              ? "unverified"
+              : "stale"
             : publication.version === document.version
               ? "fresh"
               : "stale",
@@ -293,7 +415,7 @@ export class LspClient {
       ...(publication
         ? { publicationVersion: publication.version, sequence: publication.sequence, arrivedAt: publication.arrivedAt }
         : {}),
-      knownPublicationVersion: this.diagnosticsByUri.get(document.uri)?.versioned?.version,
+      knownPublicationVersion,
       diagnostics: publication?.diagnostics ?? [],
     };
   }
@@ -419,6 +541,7 @@ export class LspClient {
             symbolKind: { valueSet: supportedSymbolKinds() },
           },
           publishDiagnostics: { versionSupport: true, relatedInformation: true, tagSupport: { valueSet: [1, 2] } },
+          diagnostic: { dynamicRegistration: true, relatedDocumentSupport: false },
         },
         workspace: {
           configuration: true,
@@ -462,9 +585,27 @@ export class LspClient {
       this.connection.onRequest("workspace/workspaceFolders", () => [
         { uri: URI.file(this.rootDir).toString(), name: basename(this.rootDir) },
       ]),
-      this.connection.onRequest("client/registerCapability", () => null),
-      this.connection.onRequest("client/unregisterCapability", () => null),
+      this.connection.onRequest("client/registerCapability", (params) => {
+        for (const registration of listParam(params, "registrations")) {
+          if (registration.method !== DocumentDiagnosticRequest.method || typeof registration.id !== "string") continue;
+          const identifier = isRecord(registration.registerOptions)
+            ? registration.registerOptions.identifier
+            : undefined;
+          this.pullRegistrations.set(registration.id, typeof identifier === "string" ? { identifier } : {});
+        }
+        this.notifyDiagnosticListeners();
+        return null;
+      }),
+      this.connection.onRequest("client/unregisterCapability", (params) => {
+        // The LSP spec keeps the historical "unregisterations" spelling.
+        for (const registration of listParam(params, "unregisterations")) {
+          if (typeof registration.id === "string") this.pullRegistrations.delete(registration.id);
+        }
+        return null;
+      }),
       this.connection.onRequest("window/workDoneProgress/create", () => null),
+      // Diagnostics are pulled per query, so a refresh needs no action; pyright exits if this request errors.
+      this.connection.onRequest("workspace/diagnostic/refresh", () => null),
     );
   }
 
@@ -545,6 +686,69 @@ function hasStdio(
   process: LspServerProcess,
 ): process is LspServerProcess & Pick<ChildProcessWithoutNullStreams, "stdin" | "stdout"> {
   return "stdin" in process && "stdout" in process && process.stdin !== null && process.stdout !== null;
+}
+
+const TSSERVER_REQUEST_COMMAND = "typescript.tsserverRequest";
+// vtsls only pushes diagnostics when they change, so a clean file never gets a push; ask tsserver instead.
+const TSSERVER_DIAGNOSTIC_COMMANDS = [
+  "syntacticDiagnosticsSync",
+  "semanticDiagnosticsSync",
+  "suggestionDiagnosticsSync",
+] as const;
+const TSSERVER_SEVERITY: Record<string, Diagnostic["severity"]> = { error: 1, warning: 2, message: 3, suggestion: 4 };
+
+function tsserverDiagnostics(response: unknown, command: string): Diagnostic[] {
+  if (!isRecord(response) || response.success !== true || !Array.isArray(response.body)) {
+    throw new Error(`tsserver ${command} did not return diagnostics.`);
+  }
+  return response.body.map((entry) => {
+    const start = isRecord(entry) ? tsserverPosition(entry.start) : undefined;
+    const end = isRecord(entry) ? tsserverPosition(entry.end) : undefined;
+    if (!isRecord(entry) || !start || !end || typeof entry.text !== "string") {
+      throw new Error(`tsserver ${command} returned a malformed diagnostic.`);
+    }
+    const tags: DiagnosticTag[] = [];
+    if (entry.reportsUnnecessary) tags.push(1);
+    if (entry.reportsDeprecated) tags.push(2);
+    return {
+      range: { start, end },
+      message: entry.text,
+      severity: TSSERVER_SEVERITY[String(entry.category)] ?? 1,
+      source: "ts",
+      ...(typeof entry.code === "number" ? { code: entry.code } : {}),
+      ...(tags.length > 0 ? { tags } : {}),
+    };
+  });
+}
+
+// tsserver positions are 1-based lines and UTF-16 offsets.
+function tsserverPosition(value: unknown): { line: number; character: number } | undefined {
+  if (!isRecord(value) || !Number.isInteger(value.line) || !Number.isInteger(value.offset)) return undefined;
+  const line = (value.line as number) - 1;
+  const character = (value.offset as number) - 1;
+  return line >= 0 && character >= 0 ? { line, character } : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function listParam(params: unknown, key: string): Array<Record<string, unknown>> {
+  const list = isRecord(params) ? params[key] : undefined;
+  return Array.isArray(list) ? list.filter(isRecord) : [];
+}
+
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  return new Promise((resolvePromise, reject) => {
+    const onAbort = () => reject(new LspError("Diagnostic query cancelled.", "cancelled"));
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolvePromise, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 function supportedSymbolKinds(): SymbolKind[] {

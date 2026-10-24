@@ -158,14 +158,24 @@ These tools have no output schema: Pi's codemode receives text on success and **
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `pending`    | No usable publication arrived within the budget: not ready, not clean.                                                                |
 | `fresh`      | Publication version matches the immutable queried version, with no known sibling-version drift and a matching return-time disk check. |
-| `stale`      | Publication version differs, or the target changed during the query; displayed results are not current.                               |
-| `unverified` | Publication has no version, or disk consistency could not be checked; current-source attribution is not confirmed.                    |
+| `stale`      | Publication version differs, a no-version publication arrived before this version was sent, or the target changed during the query.   |
+| `unverified` | A no-version publication arrived after this version was sent, or disk consistency could not be checked; attribution is not confirmed. |
 
 A received empty snapshot differs from never receiving a publication. Even fresh empty results only mean **that document version's publication was empty**, not that every dependency/project check finished or passed. A disk check observes return-time content; it does not lock against future edits. These incomplete states are successful executions with `details.ok: true`; startup/communication failures remain errors.
 
-Internal `diagnosticsWaitMs` is a bounded budget (still 350 ms by default), not an unconditional sleep. Matching cached results and no-version publications can return immediately. Cancellation, shutdown/session replacement, and server exit settle waits and clean timers/listeners. Calls share servers and capture versions independently. Positional synchronization/request sequences are serialized per file against sibling read warmup; diagnostic waits do not block newer versions.
+Diagnostics are collected through the first route the server offers:
 
-Older out-of-order versioned publications cannot replace newer evidence. The latest accepted no-version publication is displayed as `unverified`, retaining versioned evidence separately. Arrival after `didChange` alone never implies freshness. Restarted clients have separate caches.
+| Source     | Used when                                                                                         | Evidence                                                                 |
+| ---------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `pull`     | The server advertises `diagnosticProvider` or registers `textDocument/diagnostic` (pyright does). | A full report requested after the version was synced; can confirm clean. |
+| `tsserver` | The server advertises `typescript.tsserverRequest` (vtsls).                                       | Syntactic, semantic and suggestion diagnostics for the synced text.      |
+| `push`     | No request route applies, or the request fails or times out.                                      | Observed `publishDiagnostics` only, labelled as in the table above.      |
+
+vtsls publishes only when diagnostics change, so a clean file never receives a push; the `tsserver` route answers for it directly. When a server registers pull support while a query is still waiting for a push (pyright on cold start), the query switches to pull. A request result is attributed to its version only if the document did not change while it ran.
+
+`diagnosticsWaitMs` is a per-server upper bound, not an unconditional sleep: request routes return as soon as the server answers. Built-in pyright and vtsls use 15 s to cover cold project loads; other servers default to 1 s. Override it per server in global or trusted project config (integer, 0–60000). On timeout the snapshot keeps its `pending` or `stale` label and the text suggests retrying later. Results report the budget and the time actually waited. Cancellation, shutdown/session replacement, and server exit settle waits and clean timers/listeners. Calls share servers and capture versions independently. Positional synchronization/request sequences are serialized per file against sibling read warmup; diagnostic waits do not block newer versions.
+
+Older out-of-order versioned publications cannot replace newer evidence. The latest accepted no-version publication is displayed as `unverified` when it arrived after the queried version was sent and `stale` otherwise, retaining versioned evidence separately. Arrival after `didChange` alone never implies freshness. Restarted clients have separate caches.
 
 Diagnostic pagination retains the **original query snapshot's** status/evidence on every page. `lsp_more` does not recheck disk or relabel that snapshot as current. Schemas/descriptions remain static, but upgrading their definitions can change request prefixes and affect context/cache reuse; this is not a zero-cost interface change.
 

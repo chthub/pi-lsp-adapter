@@ -162,12 +162,18 @@ export function formatDiagnostics(
   options: FormatOptions = {},
 ): LspToolResult<PageMetadata<NormalizedDiagnostic>> {
   const diagnostics = result.diagnostics.map(normalizeDiagnostic).sort(compareDiagnostics);
-  const evidence = `Original query snapshot: ${result.status}; target document version ${result.targetVersion}; publication version ${result.publicationVersion ?? "not provided"}; synchronized version at return ${result.currentVersion ?? "unknown"}; disk check ${result.diskCheck}.`;
+  const waited =
+    result.waitBudgetMs === undefined ? "" : `; waited ${result.waitedMs ?? "?"} of ${result.waitBudgetMs} ms`;
+  const evidence = `Original query snapshot: ${result.status}; target document version ${result.targetVersion}; publication version ${result.publicationVersion ?? "not provided"}; synchronized version at return ${result.currentVersion ?? "unknown"}; disk check ${result.diskCheck}${result.source ? `; source ${result.source}` : ""}${waited}.`;
+  // Stale without drift or disk change means the server simply has not published this version yet.
+  const notYetPublished = result.currentVersion === result.targetVersion && result.diskCheck === "matched";
   const limitation =
     result.status === "pending"
-      ? "Diagnostics not ready: no usable publication arrived within the wait budget."
+      ? "Diagnostics not ready: no usable publication arrived within the wait budget. Retry later; the server may still be computing."
       : result.status === "stale"
-        ? "Stale snapshot: do not treat these as current diagnostics."
+        ? notYetPublished
+          ? "Stale snapshot: diagnostics for this version were not ready within the wait budget, so these are from an earlier version. Retry later; do not treat these as current diagnostics."
+          : "Stale snapshot: do not treat these as current diagnostics."
         : result.status === "unverified"
           ? "Document version or disk consistency unverified: not confirmed clean."
           : "Publication matches this document version and the return-time disk check; this is not proof all project checks finished.";

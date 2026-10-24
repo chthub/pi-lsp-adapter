@@ -27,10 +27,14 @@ class FakeConnection implements LspConnection {
   notifications: Array<{ method: string; params: unknown }> = [];
   requests: Array<{ method: string; params: unknown }> = [];
   onSync?: (uri: string, version: number) => void;
+  capabilities: Record<string, unknown> = {};
+  respond?: (method: string, params: unknown) => unknown;
+  serverRequests = new Map<string, (params: unknown) => unknown>();
   listen(): void {}
   async sendRequest<T>(method: string, params?: unknown): Promise<T> {
     this.requests.push({ method, params });
-    return (method === "initialize" ? { capabilities: {} } : null) as T;
+    if (method === "initialize") return { capabilities: this.capabilities } as T;
+    return (this.respond ? await this.respond(method, params) : null) as T;
   }
   async sendNotification(method: string, params?: unknown): Promise<void> {
     this.notifications.push({ method, params });
@@ -50,7 +54,8 @@ class FakeConnection implements LspConnection {
       },
     };
   }
-  onRequest() {
+  onRequest(method: string, handler: (params: unknown) => unknown) {
+    this.serverRequests.set(method, handler);
     return { dispose: () => undefined };
   }
   dispose(): void {}
@@ -109,11 +114,12 @@ function config(): ResolvedServerConfig {
 async function document(text = "const x = 1;") {
   return client.syncDocument(join(dir, "a.ts"), "typescript", text);
 }
-function makeRuntime(wait = 30) {
+function makeRuntime(wait = 30, serverWaitMs?: number) {
+  const server = { ...config().server, ...(serverWaitMs === undefined ? {} : { diagnosticsWaitMs: serverWaitMs }) };
   runtime = new LspRuntimeManager({
     cwd: dir,
     ownerId: "test",
-    config: { catalog: { servers: { "test-ls": config().server } }, warnings: [], installMode: "auto", warmup: true },
+    config: { catalog: { servers: { "test-ls": server } }, warnings: [], installMode: "auto", warmup: true },
     installManager: {
       ensureInstalled: async () => ({
         status: "installed",
@@ -164,6 +170,20 @@ describe("diagnostic publication sequence contract", () => {
       diagnostics: [],
       knownPublicationVersion: 1,
     });
+  });
+  it("does not let a no-version publication from before the latest sync end the wait", async () => {
+    const first = await document();
+    connection.publish(first.uri, undefined, [diagnostic]);
+    expect(await client.waitForDiagnostics(first, 0)).toMatchObject({ status: "unverified" });
+    const second = await document("const x = 2;");
+    expect(await client.waitForDiagnostics(second, 20)).toMatchObject({
+      status: "stale",
+      targetVersion: 2,
+      diagnostics: [diagnostic],
+    });
+    const waiting = client.waitForDiagnostics(second, 1000);
+    setTimeout(() => connection.publish(first.uri, undefined), 5);
+    expect(await waiting).toMatchObject({ status: "unverified", targetVersion: 2, diagnostics: [] });
   });
   it("never allows older out-of-order notifications to replace newer version evidence", async () => {
     const first = await document();
@@ -262,6 +282,190 @@ describe("diagnostic publication sequence contract", () => {
   });
 });
 
+describe("request-confirmed diagnostics", () => {
+  async function restart(capabilities: Record<string, unknown>) {
+    await client.shutdown();
+    proc = new FakeProcess();
+    connection = new FakeConnection();
+    connection.capabilities = capabilities;
+    client = new LspClient({
+      id: "synthetic",
+      ownerId: "test",
+      config: config(),
+      processRegistry: { register: async () => undefined, unregister: async () => undefined } as never,
+      spawner: () => proc,
+      connectionFactory: () => connection,
+      shutdownGraceMs: 0,
+    });
+    await client.start();
+  }
+
+  it("declares dynamic pull support and pulls once the server registers it", async () => {
+    expect(connection.requests[0]?.params).toMatchObject({
+      capabilities: { textDocument: { diagnostic: { dynamicRegistration: true } } },
+    });
+    const doc = await document();
+    expect(await client.collectDiagnostics(doc, 20)).toMatchObject({ status: "pending", source: "push" });
+
+    expect(connection.serverRequests.get("workspace/diagnostic/refresh")?.(null)).toBeNull();
+    connection.serverRequests.get("client/registerCapability")?.({
+      registrations: [{ id: "pull-1", method: "textDocument/diagnostic", registerOptions: { identifier: "pyright" } }],
+    });
+    connection.respond = (method) =>
+      method === "textDocument/diagnostic" ? { kind: "full", items: [diagnostic] } : null;
+    const second = await document("const x = 2;");
+    expect(await client.collectDiagnostics(second, 1000)).toMatchObject({
+      status: "fresh",
+      source: "pull",
+      targetVersion: 2,
+      publicationVersion: 2,
+      diagnostics: [diagnostic],
+    });
+    expect(connection.requests.at(-1)?.params).toEqual({ textDocument: { uri: doc.uri }, identifier: "pyright" });
+
+    connection.serverRequests.get("client/unregisterCapability")?.({
+      unregisterations: [{ id: "pull-1", method: "textDocument/diagnostic" }],
+    });
+    const third = await document("const x = 3;");
+    expect(await client.collectDiagnostics(third, 20)).toMatchObject({ status: "pending", source: "push" });
+  });
+
+  it("switches to pull when the server registers it while a query waits for a push", async () => {
+    connection.respond = (method) => (method === "textDocument/diagnostic" ? { kind: "full", items: [] } : null);
+    const doc = await document();
+    const waiting = client.collectDiagnostics(doc, 1000);
+    setTimeout(
+      () =>
+        connection.serverRequests.get("client/registerCapability")?.({
+          registrations: [{ id: "pull-1", method: "textDocument/diagnostic" }],
+        }),
+      5,
+    );
+    expect(await waiting).toMatchObject({ status: "fresh", source: "pull", targetVersion: 1, diagnostics: [] });
+  });
+
+  it("falls back to push evidence when a pull report is not a full report", async () => {
+    await restart({ diagnosticProvider: { interFileDependencies: false, workspaceDiagnostics: false } });
+    connection.respond = () => ({ kind: "unchanged", resultId: "r1" });
+    const doc = await document();
+    setTimeout(() => connection.publish(doc.uri, 1, [diagnostic]), 5);
+    expect(await client.collectDiagnostics(doc, 1000)).toMatchObject({
+      status: "fresh",
+      source: "push",
+      diagnostics: [diagnostic],
+    });
+  });
+
+  it("confirms a clean file through tsserver even when no push ever arrives", async () => {
+    await restart({ executeCommandProvider: { commands: ["typescript.tsserverRequest"] } });
+    connection.respond = () => ({ success: true, body: [] });
+    const doc = await document();
+    expect(await client.collectDiagnostics(doc, 1000)).toMatchObject({
+      status: "fresh",
+      source: "tsserver",
+      received: true,
+      diagnostics: [],
+    });
+    expect(connection.requests.slice(1).map((request) => request.params)).toEqual(
+      ["syntacticDiagnosticsSync", "semanticDiagnosticsSync", "suggestionDiagnosticsSync"].map((command) => ({
+        command: "typescript.tsserverRequest",
+        arguments: [command, { file: join(dir, "a.ts") }],
+      })),
+    );
+  });
+
+  it("converts tsserver positions, severities and tags to LSP diagnostics", async () => {
+    await restart({ executeCommandProvider: { commands: ["typescript.tsserverRequest"] } });
+    connection.respond = (_method, params) => {
+      const [command] = (params as { arguments: [string] }).arguments;
+      if (command === "semanticDiagnosticsSync") {
+        return {
+          success: true,
+          body: [
+            {
+              start: { line: 2, offset: 14 },
+              end: { line: 2, offset: 15 },
+              text: "Type 'string' is not assignable to type 'number'.",
+              code: 2322,
+              category: "error",
+            },
+          ],
+        };
+      }
+      if (command === "suggestionDiagnosticsSync") {
+        return {
+          success: true,
+          body: [
+            {
+              start: { line: 1, offset: 5 },
+              end: { line: 1, offset: 11 },
+              text: "'unused' is declared but its value is never read.",
+              code: 6133,
+              category: "suggestion",
+              reportsUnnecessary: true,
+            },
+          ],
+        };
+      }
+      return { success: true, body: [] };
+    };
+    const doc = await document();
+    expect((await client.collectDiagnostics(doc, 1000)).diagnostics).toEqual([
+      {
+        range: { start: { line: 1, character: 13 }, end: { line: 1, character: 14 } },
+        message: "Type 'string' is not assignable to type 'number'.",
+        severity: 1,
+        source: "ts",
+        code: 2322,
+      },
+      {
+        range: { start: { line: 0, character: 4 }, end: { line: 0, character: 10 } },
+        message: "'unused' is declared but its value is never read.",
+        severity: 4,
+        source: "ts",
+        code: 6133,
+        tags: [1],
+      },
+    ]);
+  });
+
+  it("does not attribute a request result to a version that changed while it ran", async () => {
+    await restart({ executeCommandProvider: { commands: ["typescript.tsserverRequest"] } });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    connection.respond = async () => {
+      await gate;
+      return { success: true, body: [] };
+    };
+    const first = await document();
+    const waiting = client.collectDiagnostics(first, 1000);
+    connection.respond = () => ({ success: true, body: [] });
+    await document("changed");
+    release();
+    expect(await waiting).toMatchObject({ status: "stale", targetVersion: 1, currentVersion: 2 });
+  });
+
+  it("rejects malformed tsserver responses and falls back within the budget", async () => {
+    await restart({ executeCommandProvider: { commands: ["typescript.tsserverRequest"] } });
+    connection.respond = () => ({ success: true, body: [{ text: "no range" }] });
+    const doc = await document();
+    expect(await client.collectDiagnostics(doc, 20)).toMatchObject({ status: "pending", source: "push" });
+  });
+
+  it("cancels a pending diagnostic request", async () => {
+    await restart({ executeCommandProvider: { commands: ["typescript.tsserverRequest"] } });
+    connection.respond = () => new Promise(() => undefined);
+    const doc = await document();
+    const controller = new AbortController();
+    const waiting = client.collectDiagnostics(doc, 1000, controller.signal);
+    const assertion = expect(waiting).rejects.toMatchObject({ code: "cancelled" });
+    controller.abort();
+    await assertion;
+  });
+});
+
 describe("runtime freshness and paginated snapshot semantics", () => {
   it("checks disk before declaring fresh and distinguishes no-version notifications", async () => {
     await writeFile(join(dir, "a.ts"), "first");
@@ -275,6 +479,44 @@ describe("runtime freshness and paginated snapshot semantics", () => {
     await writeFile(join(dir, "a.ts"), "second");
     connection.onSync = (uri) => connection.publish(uri);
     expect(await manager.diagnostics("a.ts")).toMatchObject({ status: "unverified", targetVersion: 2 });
+  });
+  it("waits past the old 350 ms budget for the target version up to the server's limit", async () => {
+    await writeFile(join(dir, "a.ts"), "first");
+    connection.onSync = (uri, version) => {
+      setTimeout(() => connection.publish(uri, version, [diagnostic]), 400);
+    };
+    const result = await makeRuntime(0, 2_000).diagnostics("a.ts");
+    expect(result).toMatchObject({
+      status: "fresh",
+      targetVersion: 1,
+      publicationVersion: 1,
+      diagnostics: [diagnostic],
+      waitBudgetMs: 2_000,
+    });
+    expect(result.waitedMs).toBeGreaterThanOrEqual(350);
+    expect(result.waitedMs).toBeLessThan(2_000);
+  });
+  it("returns stale with retry guidance when only the previous version is published", async () => {
+    await writeFile(join(dir, "a.ts"), "first");
+    connection.onSync = (uri, version) => {
+      if (version === 1) connection.publish(uri, version, [diagnostic]);
+    };
+    const manager = makeRuntime(0, 50);
+    expect(await manager.diagnostics("a.ts")).toMatchObject({ status: "fresh", targetVersion: 1 });
+    await writeFile(join(dir, "a.ts"), "second");
+    const result = await manager.diagnostics("a.ts");
+    expect(result).toMatchObject({
+      status: "stale",
+      targetVersion: 2,
+      currentVersion: 2,
+      publicationVersion: 1,
+      diskCheck: "matched",
+      waitBudgetMs: 50,
+    });
+    expect(result.waitedMs).toBeGreaterThanOrEqual(45);
+    const text = formatDiagnostics(result).content[0].text;
+    expect(text).toContain("were not ready within the wait budget");
+    expect(text).toContain("Retry later");
   });
   it("marks a query stale if the file changes while it waits", async () => {
     await writeFile(join(dir, "a.ts"), "first");

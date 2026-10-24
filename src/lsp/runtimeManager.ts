@@ -137,7 +137,7 @@ export class LspRuntimeManager {
     this.connectionFactory = options.connectionFactory;
     this.lockfileOptions = options.lockfileOptions ?? {};
     this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
-    this.diagnosticsWaitMs = options.diagnosticsWaitMs ?? 350;
+    this.diagnosticsWaitMs = options.diagnosticsWaitMs ?? 1_000;
     this.shutdownGraceMs = options.shutdownGraceMs ?? 1_000;
   }
 
@@ -215,7 +215,10 @@ export class LspRuntimeManager {
       if (signal?.aborted) throw new LspRuntimeError("Diagnostic query cancelled.", "cancelled");
       return this.prepareFileTarget(filePath);
     });
-    await target.client.waitForDiagnostics(target.document, this.diagnosticsWaitMs, signal);
+    const waitBudgetMs = target.client.diagnosticsWaitMs ?? this.diagnosticsWaitMs;
+    const waitStartedAt = Date.now();
+    await target.client.collectDiagnostics(target.document, waitBudgetMs, signal);
+    const waitedMs = Date.now() - waitStartedAt;
     let diskCheck: LspDiagnosticsResult["diskCheck"] = "unavailable";
     try {
       const [root, path] = await Promise.all([realpath(this.cwd), realpath(target.filePath)]);
@@ -238,6 +241,8 @@ export class LspRuntimeManager {
       filePath: target.filePath,
       uri: target.uri,
       diskCheck,
+      waitBudgetMs,
+      waitedMs,
     };
   }
 

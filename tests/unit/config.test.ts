@@ -237,6 +237,18 @@ describe("loadLspConfig", () => {
     );
   });
 
+  it("accepts a global per-server diagnostics wait budget and rejects out-of-range values", async () => {
+    await writeJson(getUserConfigPath(), {
+      servers: { pyright: { diagnosticsWaitMs: 5_000 }, vtsls: { diagnosticsWaitMs: -1 } },
+    });
+
+    const result = await loadLspConfig({ cwd: projectRoot, projectRoot });
+
+    expect(result.catalog.servers.pyright.diagnosticsWaitMs).toBe(5_000);
+    expect(result.catalog.servers.vtsls.diagnosticsWaitMs).toBe(15_000);
+    expect(result.warnings).toEqual([expect.stringContaining("Ignoring invalid vtsls server definition")]);
+  });
+
   it("infers the runtime command from explicit system install command overrides", async () => {
     await writeJson(getUserConfigPath(), {
       servers: {

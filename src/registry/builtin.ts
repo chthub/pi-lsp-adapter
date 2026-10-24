@@ -4,8 +4,12 @@ export const BUILTIN_FILETYPE_RULES: Required<FiletypeRules> = {
   exactFilenames: {},
   extensions: {
     ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".jsx": "javascriptreact",
     ".ts": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
     ".tsx": "typescriptreact",
     ".py": "python",
     ".go": "go",
@@ -47,6 +51,7 @@ export const BUILTIN_CATALOG: BuiltinCatalog = {
       settings: {},
       initializationOptions: {},
       lazy: true,
+      diagnosticsWaitMs: 15_000,
     },
     pyright: {
       id: "pyright",
@@ -65,6 +70,7 @@ export const BUILTIN_CATALOG: BuiltinCatalog = {
       settings: {},
       initializationOptions: {},
       lazy: true,
+      diagnosticsWaitMs: 15_000,
     },
     gopls: {
       id: "gopls",
