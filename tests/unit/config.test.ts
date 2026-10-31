@@ -249,6 +249,19 @@ describe("loadLspConfig", () => {
     expect(result.warnings).toEqual([expect.stringContaining("Ignoring invalid vtsls server definition")]);
   });
 
+  it("gives built-in pyright a 30 s request timeout and accepts per-server overrides", async () => {
+    await writeJson(getUserConfigPath(), {
+      servers: { vtsls: { requestTimeoutMs: 20_000 }, gopls: { requestTimeoutMs: 500 } },
+    });
+
+    const result = await loadLspConfig({ cwd: projectRoot, projectRoot });
+
+    expect(result.catalog.servers.pyright.requestTimeoutMs).toBe(30_000);
+    expect(result.catalog.servers.vtsls.requestTimeoutMs).toBe(20_000);
+    expect(result.catalog.servers.gopls.requestTimeoutMs).toBeUndefined();
+    expect(result.warnings).toEqual([expect.stringContaining("Ignoring invalid gopls server definition")]);
+  });
+
   it("infers the runtime command from explicit system install command overrides", async () => {
     await writeJson(getUserConfigPath(), {
       servers: {

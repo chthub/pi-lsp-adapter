@@ -166,7 +166,7 @@ export class LspClient {
     this.config = options.config;
     this.ownerId = options.ownerId;
     this.processRegistry = options.processRegistry;
-    this.requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
+    this.requestTimeoutMs = options.config.server.requestTimeoutMs ?? options.requestTimeoutMs ?? 10_000;
     this.shutdownGraceMs = options.shutdownGraceMs ?? 1_000;
 
     this.process = (options.spawner ?? defaultSpawner)(options.config);

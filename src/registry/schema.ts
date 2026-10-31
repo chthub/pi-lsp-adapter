@@ -70,6 +70,8 @@ export interface ServerDefinition<TServerId extends string = string> {
   lazy: boolean;
   // Upper bound for waiting on diagnostics of a newly synced version; falls back to the runtime default.
   diagnosticsWaitMs?: number;
+  // Timeout for ordinary requests such as references or definition; falls back to the runtime default.
+  requestTimeoutMs?: number;
 }
 
 export interface Catalog<TServerId extends string = string> {
@@ -170,6 +172,7 @@ export const ServerDefinitionSchema = Type.Object({
   initializationOptions: JsonObjectSchema,
   lazy: Type.Boolean(),
   diagnosticsWaitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 60_000 })),
+  requestTimeoutMs: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 120_000 })),
 });
 
 export function parseServerDefinition(value: unknown): ParseResult<ServerDefinition> {

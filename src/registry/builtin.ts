@@ -71,6 +71,7 @@ export const BUILTIN_CATALOG: BuiltinCatalog = {
       initializationOptions: {},
       lazy: true,
       diagnosticsWaitMs: 15_000,
+      requestTimeoutMs: 30_000,
     },
     gopls: {
       id: "gopls",
