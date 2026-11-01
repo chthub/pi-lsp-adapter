@@ -225,6 +225,8 @@ If that file does not exist, the extension behaves as if this config were presen
 
 > Path gotcha: config is the file `~/.pi/agent/lsp.json`. Runtime state lives under the directory `~/.pi/agent/lsp/`.
 
+Project-local adapter config is loaded from `<session cwd>/.pi/lsp.json` when the session initializes. It is not rediscovered for every nested project or sibling worktree, even though those files can use different language-server roots. Run `/reload` after changing adapter JSON config. `/lsp restart pyright` restarts the server with the already-loaded adapter settings; it is sufficient after changing Pyright's own project config.
+
 ### Runtime paths
 
 Do not edit these by hand unless you are debugging or cleaning up state:
@@ -277,7 +279,7 @@ Auto-install missing servers on first explicit LSP tool use:
 }
 ```
 
-Tune Pyright analysis from project config without changing executables:
+Limit Pyright background diagnostics from project config without changing executables:
 
 ```json
 {
@@ -286,7 +288,7 @@ Tune Pyright analysis from project config without changing executables:
       "settings": {
         "python": {
           "analysis": {
-            "diagnosticMode": "workspace"
+            "diagnosticMode": "openFilesOnly"
           }
         }
       }
@@ -294,6 +296,8 @@ Tune Pyright analysis from project config without changing executables:
   }
 }
 ```
+
+`openFilesOnly` limits background diagnostics; references can still search the project. Set the project's source-discovery scope separately; see [Repeated Pyright timeouts in large workspaces](#repeated-pyright-timeouts-in-large-workspaces).
 
 ### Server override fields
 
@@ -311,6 +315,8 @@ A server definition can include:
 | `settings`              | LSP settings returned through `workspace/configuration`     |
 | `initializationOptions` | LSP initialization options                                  |
 | `lazy`                  | Whether the server should avoid session-start eager startup |
+| `diagnosticsWaitMs`     | Diagnostics wait budget, 0–60000 ms                         |
+| `requestTimeoutMs`      | Ordinary request timeout, 1000–120000 ms                    |
 
 `command` supports placeholders such as `{installBin}`, `{installDir}`, `{platform}`, and `{workspaceDir}`. Relative path-like values are resolved from the detected project root, and `~` is expanded.
 
@@ -541,6 +547,42 @@ Or set global config to auto-install:
 ```
 
 This is the quickest way to see the final command, root markers, install state, and config warnings for one server.
+
+### Repeated Pyright timeouts in large workspaces
+
+Built-in Pyright definition, references and hover requests have a 30 s limit. Several concurrent calls can all time out after roughly 30 s of wall time. `Promise.allSettled()` reports each failed call as `rejected`; the outer codemode script completing does not mean those queries succeeded.
+
+Check source discovery before increasing the timeout or reinstalling the server:
+
+1. Use `/lsp status` and `/lsp doctor pyright` to check the server and root markers. The process registry under `~/.pi/agent/lsp/pids/` records each running server's actual `rootDir`.
+2. Check `pyrightconfig.json`, `[tool.pyright]` in `pyproject.toml`, and adapter `python.analysis` settings. Without an explicit scope, Pyright can discover historical run snapshots, generated Python files and large data/output directory trees. `.gitignore` alone does not define Pyright's analysis scope.
+3. Keep maintained source, tests, scripts and exploratory code in scope; prune generated outputs and environments. For example, merge this into the project's existing config, adapting the directory names:
+
+   ```toml
+   [tool.pyright]
+   include = ["src", "tests", "scripts"]
+   exclude = [
+     "**/node_modules",
+     "**/__pycache__",
+     "**/.*",
+     "data",
+     "results",
+     "outputs",
+     "runs",
+     "envs",
+     "checkpoints",
+   ]
+   ```
+
+   Pyright reads `[tool.pyright]`, **not `[tool.basedpyright]`**. Basedpyright also accepts `[tool.pyright]`, so common settings can be shared. Preserve existing checking levels, interpreter settings and tool-specific options; do not blindly rename a table containing basedpyright-only options. An explicit `exclude` replaces Pyright's default exclusion list, so the example retains the common default exclusions. Imported or explicitly opened files may still be analyzed.
+
+   If `pyproject.toml` is pinned by a training or release fingerprint, leave it unchanged. Use a project-root `pyrightconfig.json` with equivalent JSON fields, or adapter `python.analysis.include` / `exclude` settings instead. Preserve existing options when introducing `pyrightconfig.json`, which takes precedence over `pyproject.toml`. Adapter settings do not require changing the executable or disabling type checks.
+
+4. After editing Pyright project config, run `/lsp restart pyright` in each existing Pi session using that project. After editing adapter JSON, run `/reload` instead. Retry the affected definition/reference queries, including cross-file references to tests. Compare both a fresh server and repeated queries after source discovery finishes. During initialization, a successful references response can cover only already-discovered files; verify known cross-file references as well as latency. A fast response alone does not establish that indexing finished or that the result is complete.
+
+The adapter logs server **stderr** under `~/.pi/agent/lsp/logs/`; Pyright's protocol `window/logMessage` notifications are not saved there. A protocol trace can reveal messages such as `No include entries specified`, `Found ... source files`, or an enumeration warning. An absent stderr log does not show that indexing finished. Avoid unrestricted indexing probes in repositories whose data/output trees must not be scanned.
+
+Cold-start `request cancelled` responses are a separate failure from a 30 s timeout. A server can cancel a query during initialization or configuration changes. Currently such responses can surface as `unknown`; there is no automatic retry. Inspect the error and retry after initialization before attributing it to slow indexing.
 
 ### Reuse Mason.nvim servers
 
